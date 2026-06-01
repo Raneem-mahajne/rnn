@@ -25,7 +25,7 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        Per-window training loss vs iteration (from model.npz).
 
   6) hidden_states_pca_context_labels.png
-       2D PCA of hidden states; annotation = prev2 + current char.
+       2D PCA of hidden states; annotation = prev2 + current char (3 chars).
 
   7) hidden_states_pca_prediction_regions.png
        Two PCA panels: argmax next-char regions and prediction entropy (2D h).
@@ -269,19 +269,18 @@ def context_label(text, index):
     return f"{previous}{current}@{index}"
 
 
-def previous_two_label(text, index):
-    return "".join(display_char(char) for char in text[index - 2:index])
-
-
 def timestep_context_label(text, index):
-    """Two preceding characters plus the current input character."""
+    """Two preceding characters plus the current input character (3 chars, ^-padded)."""
     if index < 0:
         return ""
-    if index == 0:
-        return f"^{display_char(text[0])}"
-    if index == 1:
-        return f"{display_char(text[0])}{display_char(text[1])}"
-    return previous_two_label(text, index) + display_char(text[index])
+    parts = []
+    for offset in (2, 1, 0):
+        pos = index - offset
+        if pos < 0:
+            parts.append("^")
+        else:
+            parts.append(display_char(text[pos]))
+    return "".join(parts)
 
 
 def infer_task_words(text: str) -> list[str] | None:
@@ -437,14 +436,14 @@ def plot_learning_curve(model, save_path):
 
 
 def trigram_sequence_colors(labels):
-    """Stable color per unique prev2+current label (tab10, full saturation)."""
+    """Stable color per unique 3-char context label (tab10, full saturation)."""
     unique_labels = sorted(set(labels))
     cmap = plt.get_cmap("tab10", max(len(unique_labels), 1))
     return {label: cmap(i) for i, label in enumerate(unique_labels)}
 
 
 def layout_trigram_labels(text, projected):
-    """Label positions and grouping for prev2+current annotations."""
+    """Label positions and grouping for prev2+current (3-char) annotations."""
     labels = [timestep_context_label(text, i) for i in range(len(text))]
     sequence_color = trigram_sequence_colors(labels)
     by_sequence = defaultdict(list)
@@ -475,7 +474,7 @@ def layout_trigram_labels(text, projected):
 
 
 def add_trigram_annotations(ax, text, projected):
-    """Trigram-colored points, leader lines, one label per prev2+current sequence."""
+    """Context-colored points, leader lines, one label per 3-char sequence."""
     labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(text, projected)
     point_colors = [sequence_color[label] for label in labels]
 
@@ -523,7 +522,7 @@ def plot_2d_hidden_state_labels(
     text, hidden_states, chars, projected, save_path, title, xlabel, ylabel,
     fig_suptitle=None,
 ):
-    """Scatter points with one prev2+current label per sequence, lines to its points."""
+    """Scatter points with one 3-char context label per sequence, lines to its points."""
     _ = chars
     if len(text) == 0:
         return
@@ -718,14 +717,14 @@ def add_argmax_region_labels(
 
 
 def plot_pca_context_labels(text, hidden_states, chars, save_path):
-    """2D PCA of hidden states; labels show prev2 + current char."""
+    """2D PCA of hidden states; labels show prev2 + current char (3 chars)."""
     if len(text) < 1:
         return
     plot_2d_hidden_state_labels(
         text, hidden_states, chars,
         pca_2d(hidden_states),
         save_path,
-        title="2D PCA (prev2+current trigram)",
+        title="2D PCA (prev2+current, 3-char)",
         xlabel="PC1",
         ylabel="PC2",
         fig_suptitle=original_vocabulary_title(chars, text),
@@ -733,7 +732,7 @@ def plot_pca_context_labels(text, hidden_states, chars, save_path):
 
 
 def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, grid_resolution=120):
-    """PCA panels: argmax next-char regions and softmax entropy, with trigram labels."""
+    """PCA panels: argmax next-char regions and softmax entropy, with 3-char context labels."""
     n_points, hidden_size = hidden_states.shape
     vocab_size = len(chars)
     if n_points < 2 or hidden_size < 1 or len(text) == 0:
@@ -802,21 +801,8 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
         if ax is axes[1]:
             fig.colorbar(im, ax=ax, label="entropy (nats)", fraction=0.046, pad=0.02)
 
-    region_handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor=pred_cmap(i), edgecolor="none")
-        for i in range(vocab_size)
-    ]
-    axes[0].legend(
-        region_handles,
-        [f"next {display_char(c)!r}" for c in chars],
-        title="background region",
-        loc="upper right",
-        framealpha=0.92,
-        fontsize=8,
-    )
-
     fig.suptitle(
-        f"PCA plane (prev2+current trigram) · {original_vocabulary_title(chars, text)}",
+        f"PCA plane (prev2+current, 3-char) · {original_vocabulary_title(chars, text)}",
         fontsize=12, y=1.01,
     )
     fig.savefig(save_path, dpi=200, bbox_inches="tight")

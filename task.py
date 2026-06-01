@@ -12,6 +12,7 @@ Usage:
     python task.py shared_letters
     python task.py disjoint_letters --chars 200000
     python task.py one_word
+    python task.py ten_word_overlap --chars 50000
 """
 
 from __future__ import annotations
@@ -23,6 +24,12 @@ REGIMES: dict[str, list[str]] = {
     "one_word":         ["cat"],
     "disjoint_letters": ["cat", "mop", "red"],
     "shared_letters":   ["cat", "hat", "map"],
+    # 10 words, length 3; overlap on -at/-et/-ea; vowels a, e, i.
+    "ten_word_overlap": [
+        "cat", "hat", "mat", "rat",
+        "met", "pet", "net",
+        "ate", "eat", "tea",
+    ],
 }
 
 
