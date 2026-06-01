@@ -308,6 +308,36 @@ def word_subsequent_label(text: str, index: int) -> str:
     return text[start : index + 1]
 
 
+def space_to_space_segments(text: str) -> list[tuple[int, int, str]]:
+    """
+    Inclusive timestep ranges from one space to the next (or document boundaries).
+
+    Each segment includes both endpoint spaces when present.
+    """
+    n = len(text)
+    if n == 0:
+        return []
+
+    space_ix = [i for i, c in enumerate(text) if c == " "]
+    if not space_ix:
+        return [(0, n - 1, text)]
+
+    segments: list[tuple[int, int, str]] = []
+    if space_ix[0] > 0:
+        segments.append((0, space_ix[0], text[: space_ix[0] + 1]))
+    for start, end in zip(space_ix, space_ix[1:]):
+        segments.append((start, end, text[start : end + 1]))
+    if space_ix[-1] < n - 1:
+        segments.append((space_ix[-1], n - 1, text[space_ix[-1] :]))
+    return segments
+
+
+def segment_word_label(segment_text: str) -> str:
+    """Readable label for a space-to-space path (stripped word, or ␣ for spaces only)."""
+    stripped = segment_text.strip()
+    return stripped if stripped else "␣"
+
+
 def context_label(text, index, *, spaced: bool = False):
     if spaced:
         return word_subsequent_label(text, index)
@@ -975,6 +1005,80 @@ def plot_pca_context_labels(
     )
 
 
+def _word_trajectory_colors(segments: list[tuple[int, int, str]]) -> dict[str, tuple]:
+    """Stable color per distinct word label across space-to-space segments."""
+    words = sorted({segment_word_label(seg) for _, _, seg in segments})
+    cmap = plt.get_cmap("tab20", max(len(words), 1))
+    return {word: cmap(i) for i, word in enumerate(words)}
+
+
+def plot_space_to_space_trajectories(
+    text: str,
+    hidden_states: np.ndarray,
+    save_path: str,
+):
+    """PCA plot of every hidden-state path from one space timestep to the next."""
+    segments = space_to_space_segments(text)
+    if len(text) < 2 or not segments:
+        return
+
+    projected, _, _ = fit_pca_2d(hidden_states)
+    word_colors = _word_trajectory_colors(segments)
+
+    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
+
+    for start, end, segment_text in segments:
+        path = projected[start : end + 1]
+        if len(path) == 0:
+            continue
+        color = word_colors[segment_word_label(segment_text)]
+
+        ax.plot(
+            path[:, 0], path[:, 1],
+            color=color, linewidth=1.6, alpha=0.55, solid_capstyle="round", zorder=2,
+        )
+        if len(path) >= 2:
+            ax.quiver(
+                path[:-1, 0], path[:-1, 1],
+                path[1:, 0] - path[:-1, 0], path[1:, 1] - path[:-1, 1],
+                angles="xy", scale_units="xy", scale=1,
+                color=color, width=0.005, headwidth=4.5, headlength=5.5,
+                headaxislength=4.5, alpha=0.95, zorder=3,
+            )
+        ax.scatter(
+            path[:, 0], path[:, 1],
+            s=32, c=[color] * len(path),
+            edgecolors="black", linewidths=0.4, zorder=4,
+        )
+
+    handles = [
+        Patch(facecolor=word_colors[w], edgecolor="#333333", label=w)
+        for w in sorted(word_colors)
+    ]
+    ax.legend(
+        handles=handles,
+        title="word",
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        fontsize=7,
+        title_fontsize=8,
+        framealpha=0.95,
+    )
+
+    ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(
+        f"Space-to-space trajectories in PCA ({len(segments)} segments, "
+        f"{len(text)} chars)"
+    )
+    ax.grid(True, linestyle=":", alpha=0.35)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
 def plot_pca_dfa_analysis(
     text,
     hidden_states,
@@ -1372,6 +1476,14 @@ def main() -> None:
             save_path=os.path.join(out_dir, "hidden_states_pca_dfa_analysis.png"),
             automaton=automaton,
             spaced=spaced,
+        )
+
+    if spaced:
+        plot_space_to_space_trajectories(
+            text, hidden_states,
+            save_path=os.path.join(
+                out_dir, "hidden_states_space_to_space_trajectories.png"
+            ),
         )
 
     plot_pca_next_char_probability_panels(
