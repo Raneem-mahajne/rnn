@@ -59,8 +59,18 @@ import pandas as pd
 import seaborn as sns
 from scipy import ndimage
 
-from experiment import ensure_experiment_dirs, input_path, model_path, plots_dir
+from experiment import (
+    ensure_experiment_dirs,
+    experiment_uses_word_space,
+    input_path,
+    model_path,
+    plots_dir,
+)
 from task import REGIMES
+from vocab_diagrams import (
+    vocabulary_for_experiment,
+    write_vocabulary_diagrams,
+)
 
 
 def load_model(path: str = "model.npz"):
@@ -264,14 +274,36 @@ def display_char(char):
     return char
 
 
-def context_label(text, index):
+def corpus_uses_word_spacing(text: str, exp_name: str | None = None) -> bool:
+    if exp_name is not None and experiment_uses_word_space(exp_name):
+        return True
+    return " " in text
+
+
+def word_subsequent_label(text: str, index: int) -> str:
+    """Spaced corpora: ' ' on a space; else prefix from after the last space through here."""
+    if index < 0 or index >= len(text):
+        return ""
+    if text[index] == " ":
+        return " "
+    start = index
+    while start > 0 and text[start - 1] != " ":
+        start -= 1
+    return text[start : index + 1]
+
+
+def context_label(text, index, *, spaced: bool = False):
+    if spaced:
+        return word_subsequent_label(text, index)
     previous = "^" if index == 0 else display_char(text[index - 1])
     current = display_char(text[index])
     return f"{previous}{current}@{index}"
 
 
-def timestep_context_label(text, index):
-    """Two preceding characters plus the current input character (3 chars, ^-padded)."""
+def timestep_context_label(text, index, *, spaced: bool = False):
+    """Context string for plot labels (trigram, or growing prefix after last space)."""
+    if spaced:
+        return word_subsequent_label(text, index)
     if index < 0:
         return ""
     parts = []
@@ -284,13 +316,22 @@ def timestep_context_label(text, index):
     return "".join(parts)
 
 
+def timestep_axis_description(text: str, exp_name: str | None = None) -> str:
+    if corpus_uses_word_spacing(text, exp_name):
+        return "timestep (prefix after space, or ' ')"
+    return "timestep (prev2 + current)"
+
+
 def infer_task_words(text: str) -> list[str] | None:
     """Best-matching word vocabulary from task.py regimes for this corpus."""
     text_chars = set(text)
+    allow_space = " " in text_chars
     best_words = None
     best_char_count = None
     for words in REGIMES.values():
         regime_chars = set("".join(words))
+        if allow_space:
+            regime_chars.add(" ")
         if text_chars <= regime_chars:
             n = len(regime_chars)
             if best_char_count is None or n < best_char_count:
@@ -310,13 +351,16 @@ def original_vocabulary_title(chars, text: str | None = None) -> str:
     return " · ".join(parts)
 
 
-def plot_hidden_states_clustermap(text, hidden_states, chars, save_path):
+def plot_hidden_states_clustermap(
+    text, hidden_states, chars, save_path, *, exp_name: str | None = None
+):
     """Heatmap (timesteps × hidden units) with seaborn clustermap layout."""
     n_rows, n_cols = hidden_states.shape
     if n_rows == 0:
         return
 
-    row_labels = [timestep_context_label(text, t) for t in range(n_rows)]
+    spaced = corpus_uses_word_spacing(text, exp_name)
+    row_labels = [timestep_context_label(text, t, spaced=spaced) for t in range(n_rows)]
     col_labels = [f"h{i}" for i in range(n_cols)]
     data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels)
 
@@ -335,7 +379,7 @@ def plot_hidden_states_clustermap(text, hidden_states, chars, save_path):
         yticklabels=True,
     )
     grid.ax_heatmap.set_xlabel("hidden unit")
-    grid.ax_heatmap.set_ylabel("timestep (prev2 + current)")
+    grid.ax_heatmap.set_ylabel(timestep_axis_description(text, exp_name))
     grid.ax_heatmap.tick_params(axis="y", labelsize=7)
     grid.ax_heatmap.tick_params(axis="x", labelsize=8)
     grid.fig.suptitle(
@@ -443,9 +487,9 @@ def trigram_sequence_colors(labels):
     return {label: cmap(i) for i, label in enumerate(unique_labels)}
 
 
-def layout_trigram_labels(text, projected):
-    """Label positions and grouping for prev2+current (3-char) annotations."""
-    labels = [timestep_context_label(text, i) for i in range(len(text))]
+def layout_trigram_labels(text, projected, *, spaced: bool = False):
+    """Label positions and grouping for context annotations on PCA plots."""
+    labels = [timestep_context_label(text, i, spaced=spaced) for i in range(len(text))]
     sequence_color = trigram_sequence_colors(labels)
     by_sequence = defaultdict(list)
     for i, label in enumerate(labels):
@@ -474,15 +518,39 @@ def layout_trigram_labels(text, projected):
     return labels, sequence_color, by_sequence, label_positions
 
 
-def add_trigram_annotations(ax, text, projected):
-    """Context-colored points, leader lines, one label per 3-char sequence."""
-    labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(text, projected)
+CONTEXT_LABEL_FONTSIZE = 9
+
+
+def _context_annotation_bbox(edge_color: str) -> dict:
+    """Opaque label box readable on top of colored contour regions."""
+    return dict(
+        boxstyle="round,pad=0.22",
+        facecolor="#ffffff",
+        edgecolor=edge_color,
+        linewidth=1.0,
+        alpha=1.0,
+    )
+
+
+def _context_annotation_effects():
+    """Thin outline so small labels stay legible without looking heavy."""
+    return [
+        path_effects.withStroke(linewidth=2.5, foreground="#ffffff"),
+        path_effects.Normal(),
+    ]
+
+
+def add_trigram_annotations(ax, text, projected, *, spaced: bool = False):
+    """Context-colored points, leader lines, one label per context group."""
+    labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(
+        text, projected, spaced=spaced
+    )
     point_colors = [sequence_color[label] for label in labels]
 
     ax.scatter(
         projected[:, 0], projected[:, 1],
-        s=48, c=point_colors, edgecolors="black", linewidths=0.6,
-        zorder=4,
+        s=40, c=point_colors, edgecolors="black", linewidths=0.5,
+        zorder=6,
     )
 
     for label, indices in by_sequence.items():
@@ -491,16 +559,16 @@ def add_trigram_annotations(ax, text, projected):
         for point in projected[indices]:
             ax.plot(
                 [text_pos[0], point[0]], [text_pos[1], point[1]],
-                color=color, linewidth=1.4, solid_capstyle="round", zorder=3,
+                color=color, linewidth=1.4, solid_capstyle="round", zorder=5,
             )
+        display = "␣" if label == " " else label
         ax.text(
-            text_pos[0], text_pos[1], label,
-            fontsize=10, fontweight="bold", color=color, ha="center", va="center",
-            bbox=dict(
-                boxstyle="round,pad=0.25", facecolor="white",
-                edgecolor=color, linewidth=1.2,
-            ),
-            zorder=5,
+            text_pos[0], text_pos[1], display,
+            fontsize=CONTEXT_LABEL_FONTSIZE, color="#1a1a1a",
+            ha="center", va="center",
+            bbox=_context_annotation_bbox(color),
+            path_effects=_context_annotation_effects(),
+            zorder=10,
         )
 
     return list(label_positions.values())
@@ -520,16 +588,25 @@ def _expand_limits_for_annotations(ax, projected, text_positions, base_xlim, bas
 
 
 def plot_2d_hidden_state_labels(
-    text, hidden_states, chars, projected, save_path, title, xlabel, ylabel,
+    text,
+    hidden_states,
+    chars,
+    projected,
+    save_path,
+    title,
+    xlabel,
+    ylabel,
     fig_suptitle=None,
+    *,
+    spaced: bool = False,
 ):
-    """Scatter points with one 3-char context label per sequence, lines to its points."""
+    """Scatter points with one context label per group, lines to its points."""
     _ = chars
     if len(text) == 0:
         return
 
     fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
-    text_positions = add_trigram_annotations(ax, text, projected)
+    text_positions = add_trigram_annotations(ax, text, projected, spaced=spaced)
     _expand_limits_for_annotations(
         ax, projected, text_positions,
         (projected[:, 0].min(), projected[:, 0].max()),
@@ -549,7 +626,9 @@ def plot_2d_hidden_state_labels(
     print(f"wrote {save_path}")
 
 
-def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, cluster_rows=True):
+def plot_per_char_hidden_state_heatmaps(
+    text, hidden_states, chars, save_path, cluster_rows=True, *, spaced: bool = False
+):
     """Combined per-input-char heatmaps, rows = hidden units, columns = occurrences."""
     hidden_size = hidden_states.shape[1]
     groups = []
@@ -560,7 +639,7 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
             continue
 
         rows = hidden_states[indices]
-        labels = [context_label(text, int(i)) for i in indices]
+        labels = [context_label(text, int(i), spaced=spaced) for i in indices]
 
         if cluster_rows and len(indices) > 2:
             order = average_linkage_cluster_order(rows)
@@ -603,7 +682,11 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
             f"({len(labels)} occurrences, {title_suffix})"
         )
 
-    axes[-1].set_xlabel("previous + current character @ timestep")
+    axes[-1].set_xlabel(
+        "prefix after space (or ' ') @ timestep"
+        if spaced
+        else "previous + current character @ timestep"
+    )
     fig.suptitle(
         f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
         y=0.995,
@@ -614,9 +697,9 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
     print(f"wrote {save_path}")
 
 
-def trigram_avoidance_points(text, projected):
+def trigram_avoidance_points(text, projected, *, spaced: bool = False):
     """PC coordinates to keep region letters away from (scatter + label boxes)."""
-    _, _, _, label_positions = layout_trigram_labels(text, projected)
+    _, _, _, label_positions = layout_trigram_labels(text, projected, spaced=spaced)
     blocks = [projected]
     if label_positions:
         blocks.append(np.array(list(label_positions.values())))
@@ -694,7 +777,7 @@ def add_argmax_region_labels(
     avoid_xy=None, avoid_radius=0.0, xlim=None, ylim=None,
 ):
     """Large white letter at the interior of each argmax region."""
-    stroke = path_effects.withStroke(linewidth=4, foreground="#1a1a1a")
+    stroke = path_effects.withStroke(linewidth=2.5, foreground="#1a1a1a")
     for index, char in enumerate(chars):
         mask = grid_pred == index
         if not mask.any():
@@ -711,29 +794,49 @@ def add_argmax_region_labels(
             continue
         ax.text(
             position[0], position[1], letter,
-            fontsize=34, fontweight="bold", color="white",
-            ha="center", va="center", zorder=6,
-            path_effects=[stroke],
+            fontsize=26, color="white",
+            ha="center", va="center", zorder=8,
+            path_effects=[
+                path_effects.withStroke(linewidth=3.5, foreground="#ffffff"),
+                stroke,
+            ],
         )
 
 
-def plot_pca_context_labels(text, hidden_states, chars, save_path):
-    """2D PCA of hidden states; labels show prev2 + current char (3 chars)."""
+def plot_pca_context_labels(
+    text, hidden_states, chars, save_path, *, spaced: bool = False
+):
+    """2D PCA of hidden states with context labels."""
     if len(text) < 1:
         return
+    title = (
+        "2D PCA (prefix after space)"
+        if spaced
+        else "2D PCA (prev2+current, 3-char)"
+    )
     plot_2d_hidden_state_labels(
         text, hidden_states, chars,
         pca_2d(hidden_states),
         save_path,
-        title="2D PCA (prev2+current, 3-char)",
+        title=title,
         xlabel="PC1",
         ylabel="PC2",
         fig_suptitle=original_vocabulary_title(chars, text),
+        spaced=spaced,
     )
 
 
-def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, grid_resolution=120):
-    """PCA panels: argmax next-char regions and softmax entropy, with 3-char context labels."""
+def plot_pca_prediction_regions(
+    model,
+    text,
+    hidden_states,
+    chars,
+    save_path,
+    grid_resolution=120,
+    *,
+    spaced: bool = False,
+):
+    """PCA panels: argmax next-char regions and softmax entropy, with context labels."""
     n_points, hidden_size = hidden_states.shape
     vocab_size = len(chars)
     if n_points < 2 or hidden_size < 1 or len(text) == 0:
@@ -746,7 +849,7 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
     grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
     grid_entropy = prediction_entropy(probs).reshape(grid_resolution, grid_resolution)
     max_entropy = float(np.log(vocab_size))
-    avoid_xy = trigram_avoidance_points(text, projected)
+    avoid_xy = trigram_avoidance_points(text, projected, spaced=spaced)
     plane_span = max(
         float(np.ptp(grid_x)),
         float(np.ptp(grid_y)),
@@ -794,7 +897,7 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
                 avoid_xy=avoid_xy, avoid_radius=avoid_radius,
                 xlim=xlim, ylim=ylim,
             )
-        add_trigram_annotations(ax, text, projected)
+        add_trigram_annotations(ax, text, projected, spaced=spaced)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_title(title)
@@ -802,8 +905,9 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
         if ax is axes[1]:
             fig.colorbar(im, ax=ax, label="entropy (nats)", fraction=0.046, pad=0.02)
 
+    pca_ctx = "prefix after space" if spaced else "prev2+current, 3-char"
     fig.suptitle(
-        f"PCA plane (prev2+current, 3-char) · {original_vocabulary_title(chars, text)}",
+        f"PCA plane ({pca_ctx}) · {original_vocabulary_title(chars, text)}",
         fontsize=12, y=1.01,
     )
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -1008,6 +1112,10 @@ def main() -> None:
         text = f.read()[: args.length]
     print(f"running forward pass over {len(text)} characters of {input_file}")
 
+    spaced = corpus_uses_word_spacing(text, args.exp)
+    if spaced:
+        print("annotation mode: prefix after space (e.g. h, ha, hat; ' ' on spaces)")
+
     hidden_states, output_probs = forward_pass(model, text)
     targets = list(text[1:]) + [text[0]]
 
@@ -1025,16 +1133,19 @@ def main() -> None:
         text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_by_input_char.png"),
         cluster_rows=not args.no_cluster_per_char,
+        spaced=spaced,
     )
 
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_pca_context_labels.png"),
+        spaced=spaced,
     )
 
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_pca_prediction_regions.png"),
+        spaced=spaced,
     )
 
     plot_pca_next_char_probability_panels(
@@ -1045,6 +1156,7 @@ def main() -> None:
     plot_hidden_states_clustermap(
         text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_clustermap.png"),
+        exp_name=args.exp,
     )
 
     if model["hidden_size"] == 2:
@@ -1067,6 +1179,12 @@ def main() -> None:
                      np.array([model["chars"].index(c) for c in targets]))
     print(f"top-1 next-char accuracy over the {len(text)}-char window: "
           f"{correct}/{len(text)} = {100*correct/len(text):.1f}%")
+
+    words = vocabulary_for_experiment(args.exp) if args.exp else infer_task_words(text)
+    if words:
+        trie_path, dfa_path = write_vocabulary_diagrams(words, Path(out_dir))
+        print(f"wrote {trie_path}")
+        print(f"wrote {dfa_path}")
 
 
 if __name__ == "__main__":

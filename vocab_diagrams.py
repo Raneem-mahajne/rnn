@@ -717,6 +717,21 @@ def render_dfa_svg(
     return "\n".join(lines)
 
 
+def vocabulary_for_experiment(exp_name: str) -> list[str]:
+    """Word list for an experiment name (handles `<regime>_s` spaced variants)."""
+    from experiment import experiment_regime
+
+    return REGIMES[experiment_regime(exp_name)]
+
+
+def write_vocabulary_diagrams_for_experiment(exp_name: str) -> tuple[Path, Path]:
+    """Write trie + min-DFA SVGs under experiments/<exp_name>/plots/."""
+    return write_vocabulary_diagrams(
+        vocabulary_for_experiment(exp_name),
+        experiment_plots_dir(exp_name),
+    )
+
+
 def write_vocabulary_diagrams(
     words: list[str],
     out_dir: Path,

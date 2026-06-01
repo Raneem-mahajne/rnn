@@ -12,8 +12,7 @@ import argparse
 import subprocess
 import sys
 
-from experiment import EXPERIMENT_CONFIG, model_path, input_path
-from task import REGIMES
+from experiment import EXPERIMENT_CONFIG, experiment_regime, model_path, input_path
 
 
 def run(cmd: list[str]) -> None:
@@ -24,22 +23,27 @@ def run(cmd: list[str]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--only", nargs="+", choices=list(REGIMES.keys()),
-                        help="subset of experiments to run")
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        choices=list(EXPERIMENT_CONFIG.keys()),
+        help="subset of experiments to run (include <regime>_s for word-space corpora)",
+    )
     parser.add_argument("--skip-train", action="store_true",
                         help="only run visualize.py (requires existing model.npz)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    names = args.only if args.only else list(REGIMES.keys())
+    names = args.only if args.only else list(EXPERIMENT_CONFIG.keys())
 
     for name in names:
         cfg = EXPERIMENT_CONFIG.get(name, EXPERIMENT_CONFIG["shared_letters"])
+        regime = experiment_regime(name)
         print(f"\n=== {name} ===")
 
         if not args.skip_train:
             run([
-                sys.executable, "task.py", name,
+                sys.executable, "task.py", regime,
                 "--exp", name,
                 "--chars", str(cfg["chars"]),
                 "--seed", str(args.seed),

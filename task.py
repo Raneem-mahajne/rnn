@@ -21,7 +21,13 @@ from __future__ import annotations
 import argparse
 import random
 
-from experiment import input_path as experiment_input_path
+from experiment import (
+    EXPERIMENT_CONFIG,
+    experiment_regime,
+    experiment_uses_word_space,
+    input_path as experiment_input_path,
+    spaced_experiment_name,
+)
 
 REGIMES: dict[str, list[str]] = {
     "one_word":         ["cat"],
@@ -36,11 +42,24 @@ REGIMES: dict[str, list[str]] = {
 }
 
 
-def generate_sequence(words: list[str], num_chars: int, seed: int = 0) -> str:
+def generate_sequence(
+    words: list[str],
+    num_chars: int,
+    seed: int = 0,
+    *,
+    word_space: bool = False,
+) -> str:
     rng = random.Random(seed)
     out: list[str] = []
     while len(out) < num_chars:
-        out.extend(rng.choice(words))
+        if word_space and out:
+            out.append(" ")
+            if len(out) >= num_chars:
+                break
+        for ch in rng.choice(words):
+            if len(out) >= num_chars:
+                break
+            out.append(ch)
     return "".join(out[:num_chars])
 
 
@@ -56,21 +75,36 @@ def main() -> None:
                         help="experiment name (default: regime); writes experiments/<exp>/input.txt")
     parser.add_argument("--out", default=None,
                         help="output path (overrides --exp)")
+    parser.add_argument(
+        "--word-space",
+        action="store_true",
+        help="insert a space between sampled words (experiment name gets _s suffix)",
+    )
     args = parser.parse_args()
+
+    exp_name = args.exp or args.regime
+    if args.exp and args.exp in EXPERIMENT_CONFIG:
+        word_space = bool(EXPERIMENT_CONFIG[args.exp].get("word_space", False))
+        regime = experiment_regime(args.exp)
+    else:
+        regime = args.regime
+        word_space = args.word_space or experiment_uses_word_space(exp_name)
+        if word_space and not exp_name.endswith("_s"):
+            exp_name = spaced_experiment_name(regime)
 
     out_path = args.out
     if out_path is None:
-        exp_name = args.exp or args.regime
         out_path = str(experiment_input_path(exp_name))
         experiment_input_path(exp_name).parent.mkdir(parents=True, exist_ok=True)
 
-    words = REGIMES[args.regime]
-    text = generate_sequence(words, args.chars, seed=args.seed)
+    words = REGIMES[regime]
+    text = generate_sequence(words, args.chars, seed=args.seed, word_space=word_space)
     with open(out_path, "w") as f:
         f.write(text)
 
     vocab = sorted(set(text))
-    print(f"Regime:  {args.regime}")
+    print(f"Regime:  {regime}" + (" (word-space)" if word_space else ""))
+    print(f"Exp:     {exp_name}")
     print(f"Words:   {words}")
     print(f"Vocab:   {''.join(vocab)} ({len(vocab)} symbols)")
     print(f"Wrote:   {out_path} ({len(text):,} characters)")
