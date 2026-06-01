@@ -1430,6 +1430,117 @@ def plot_learned_weights(model, out_dir):
     print(f"wrote {save_path}")
 
 
+def _mean_in_per_unit(W_in: np.ndarray, W_rec: np.ndarray) -> np.ndarray:
+    """Mean weight over all connections into each hidden unit (input + recurrent row)."""
+    hidden_size = W_in.shape[0]
+    return np.array([
+        np.mean(np.concatenate([W_in[i], W_rec[i]]))
+        for i in range(hidden_size)
+    ])
+
+
+def _mean_out_per_unit(W_rec: np.ndarray, W_out: np.ndarray) -> np.ndarray:
+    """Mean weight over all connections out of each hidden unit (recurrent col + readout col)."""
+    hidden_size = W_rec.shape[0]
+    return np.array([
+        np.mean(np.concatenate([W_rec[:, j], W_out[:, j]]))
+        for j in range(hidden_size)
+    ])
+
+
+def plot_weight_eigenspectra(model, save_path: str) -> None:
+    """Spectra, pooled weight histogram, and per-unit mean |in| / |out|."""
+    W_in = np.asarray(model["weights_input_to_hidden"])
+    W_rec = np.asarray(model["weights_hidden_to_hidden"])
+    W_out = np.asarray(model["weights_hidden_to_output"])
+    b_h = np.asarray(model["bias_hidden"]).ravel()
+    b_o = np.asarray(model["bias_output"]).ravel()
+    hidden_size = W_in.shape[0]
+    unit_labels = [f"h{i}" for i in range(hidden_size)]
+
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7.5), constrained_layout=True)
+
+    eigs = np.linalg.eigvals(W_rec)
+    ax = axes[0, 0]
+    theta = np.linspace(0, 2 * np.pi, 200)
+    ax.plot(np.cos(theta), np.sin(theta), color="#888888", lw=0.9, ls="--", zorder=1)
+    ax.scatter(
+        eigs.real, eigs.imag,
+        c=np.abs(eigs), cmap="viridis", s=55, edgecolors="black", linewidths=0.4, zorder=3,
+    )
+    ax.axhline(0, color="lightgrey", lw=0.6)
+    ax.axvline(0, color="lightgrey", lw=0.6)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Re(λ)")
+    ax.set_ylabel("Im(λ)")
+    ax.set_title(r"$W_{hh}$ eigenvalues")
+    ax.grid(True, linestyle=":", alpha=0.35)
+
+    for ax, name, W in zip(
+        axes[0, 1:],
+        (r"$W_{xh}$ singular values", r"$W_{ho}$ singular values"),
+        (W_in, W_out),
+    ):
+        singular = np.linalg.svd(W, compute_uv=False)
+        ax.bar(np.arange(len(singular)), singular, color="#4c72b0", edgecolor="black", linewidth=0.3)
+        ax.set_xlabel("index")
+        ax.set_ylabel("σ")
+        ax.set_title(name)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.35)
+
+    all_weights = np.concatenate([
+        W_in.ravel(), W_rec.ravel(), W_out.ravel(), b_h, b_o,
+    ])
+    ax_hist = axes[1, 0]
+    bins = np.linspace(-np.max(np.abs(all_weights)), np.max(np.abs(all_weights)), 41)
+    ax_hist.hist(
+        all_weights, bins=bins, color="#888888", alpha=0.55,
+        edgecolor="white", linewidth=0.4, density=True, label="all",
+    )
+    ax_hist.hist(
+        W_in.ravel(), bins=bins, color="#4c72b0", alpha=0.45,
+        edgecolor="white", linewidth=0.3, density=True, label=r"$W_{xh}$ (in)",
+    )
+    ax_hist.hist(
+        W_out.ravel(), bins=bins, color="#dd8452", alpha=0.45,
+        edgecolor="white", linewidth=0.3, density=True, label=r"$W_{ho}$ (out)",
+    )
+    ax_hist.axvline(0, color="black", lw=0.8)
+    ax_hist.set_xlabel("weight value")
+    ax_hist.set_ylabel("density")
+    ax_hist.set_title("Weight distributions")
+    ax_hist.legend(fontsize=7, framealpha=0.9)
+    ax_hist.grid(True, axis="y", linestyle=":", alpha=0.35)
+
+    mean_in = _mean_in_per_unit(W_in, W_rec)
+    mean_out = _mean_out_per_unit(W_rec, W_out)
+    x = np.arange(hidden_size)
+    width = 0.38
+
+    ax_in = axes[1, 1]
+    ax_in.bar(x - width / 2, mean_in, width=width, color="#4c72b0", edgecolor="black", linewidth=0.3)
+    ax_in.set_xticks(x)
+    ax_in.set_xticklabels(unit_labels)
+    ax_in.axhline(0, color="black", lw=0.8)
+    ax_in.set_ylabel("mean weight")
+    ax_in.set_title("Mean incoming per unit")
+    ax_in.grid(True, axis="y", linestyle=":", alpha=0.35)
+
+    ax_out = axes[1, 2]
+    ax_out.bar(x + width / 2, mean_out, width=width, color="#dd8452", edgecolor="black", linewidth=0.3)
+    ax_out.set_xticks(x)
+    ax_out.set_xticklabels(unit_labels)
+    ax_out.axhline(0, color="black", lw=0.8)
+    ax_out.set_ylabel("mean weight")
+    ax_out.set_title("Mean outgoing per unit")
+    ax_out.grid(True, axis="y", linestyle=":", alpha=0.35)
+
+    fig.suptitle("Weight spectra and distributions (final model)", y=1.01)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
 def plot_output_probs(text, output_probs, chars, save_path):
     """Heatmap of P(next char) over time; overlay the true next char."""
     vocab_size = len(chars)
@@ -1502,6 +1613,9 @@ def main() -> None:
           f"vocab_size={model['vocab_size']}, chars={''.join(model['chars'])}")
 
     plot_learned_weights(model, out_dir)
+    plot_weight_eigenspectra(
+        model, save_path=os.path.join(out_dir, "weights_eigenspectra.png")
+    )
     plot_learning_curve(
         model,
         save_path=os.path.join(out_dir, "learning_curve.png"),
