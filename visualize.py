@@ -28,19 +28,16 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        2D PCA of hidden states; annotation = prev2 + current char.
 
   7) hidden_states_pca_prediction_regions.png
-       PCA plane colored by argmax next-char prediction (2D reconstruction).
+       Two PCA panels: argmax next-char regions and prediction entropy (2D h).
 
   8) hidden_states_pca_next_char_prob_panels.png
        One panel per vocab char: P(next = char) over the PCA plane (softmax).
 
-  9) hidden_states_mds_context_labels.png
-       2D MDS from the same euclidean distances as the clustermap dendrogram.
-
-  10) hidden_states_clustermap.png
+  9) hidden_states_clustermap.png
        Heatmap of timesteps × hidden units with row/column dendrograms
        (average linkage). Row labels: two preceding chars + current char.
 
-  11) weights.png
+  10) weights.png
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
@@ -59,7 +56,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.spatial.distance import pdist, squareform
+from task import REGIMES
 
 
 def load_model(path: str = "model.npz"):
@@ -284,7 +281,33 @@ def timestep_context_label(text, index):
     return previous_two_label(text, index) + display_char(text[index])
 
 
-def plot_hidden_states_clustermap(text, hidden_states, save_path):
+def infer_task_words(text: str) -> list[str] | None:
+    """Best-matching word vocabulary from task.py regimes for this corpus."""
+    text_chars = set(text)
+    best_words = None
+    best_char_count = None
+    for words in REGIMES.values():
+        regime_chars = set("".join(words))
+        if text_chars <= regime_chars:
+            n = len(regime_chars)
+            if best_char_count is None or n < best_char_count:
+                best_words = words
+                best_char_count = n
+    return best_words
+
+
+def original_vocabulary_title(chars, text: str | None = None) -> str:
+    """Suptitle text: task word vocabulary (inferred) and model character vocab."""
+    parts = []
+    if text:
+        words = infer_task_words(text)
+        if words:
+            parts.append(f"vocabulary: {', '.join(words)}")
+    parts.append(f"chars: {''.join(chars)}")
+    return " · ".join(parts)
+
+
+def plot_hidden_states_clustermap(text, hidden_states, chars, save_path):
     """Heatmap (timesteps × hidden units) with seaborn clustermap layout."""
     n_rows, n_cols = hidden_states.shape
     if n_rows == 0:
@@ -312,7 +335,10 @@ def plot_hidden_states_clustermap(text, hidden_states, save_path):
     grid.ax_heatmap.set_ylabel("timestep (prev2 + current)")
     grid.ax_heatmap.tick_params(axis="y", labelsize=7)
     grid.ax_heatmap.tick_params(axis="x", labelsize=8)
-    grid.fig.suptitle("Hidden states clustered (timesteps × units)", y=1.02, fontsize=11)
+    grid.fig.suptitle(
+        f"Hidden states clustered (timesteps × units) · {original_vocabulary_title(chars, text)}",
+        y=1.02, fontsize=11,
+    )
     grid.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(grid.fig)
     print(f"wrote {save_path}")
@@ -353,6 +379,12 @@ def next_char_probabilities(model, hidden_states):
     return exp / np.sum(exp, axis=1, keepdims=True)
 
 
+def prediction_entropy(probs):
+    """Shannon entropy (nats) of each row of a probability matrix."""
+    p = np.clip(probs, 1e-12, 1.0)
+    return -np.sum(p * np.log(p), axis=1)
+
+
 def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
     """PCA mesh and 2D-reconstructed hidden states on a grid covering data + labels."""
     projected, mean, components = fit_pca_2d(hidden_states)
@@ -381,22 +413,6 @@ def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
     return grid_x, grid_y, grid_hidden, projected, xlim, ylim
 
 
-def mds_2d(points):
-    """Classical MDS on euclidean distances (same metric as clustermap)."""
-    n = points.shape[0]
-    if n < 2:
-        return np.zeros((n, 2))
-
-    distances = squareform(pdist(points, metric="euclidean"))
-    centering = np.eye(n) - np.ones((n, n)) / n
-    gram = -0.5 * centering @ (distances ** 2) @ centering
-    eigenvalues, eigenvectors = np.linalg.eigh(gram)
-    order = np.argsort(eigenvalues)[::-1]
-    eigenvalues = np.maximum(eigenvalues[order[:2]], 0.0)
-    basis = eigenvectors[:, order[:2]]
-    return basis * np.sqrt(eigenvalues)
-
-
 def plot_learning_curve(model, save_path):
     """Plot per-window training loss recorded during training."""
     if "loss_iterations" not in model:
@@ -418,13 +434,10 @@ def plot_learning_curve(model, save_path):
 
 
 def trigram_sequence_colors(labels):
-    """Stable color per unique prev2+current label."""
+    """Stable color per unique prev2+current label (tab10, full saturation)."""
     unique_labels = sorted(set(labels))
-    cmap = plt.get_cmap("tab20" if len(unique_labels) <= 20 else "hsv")
-    return {
-        label: cmap(i / max(len(unique_labels) - 1, 1))
-        for i, label in enumerate(unique_labels)
-    }
+    cmap = plt.get_cmap("tab10", max(len(unique_labels), 1))
+    return {label: cmap(i) for i, label in enumerate(unique_labels)}
 
 
 def layout_trigram_labels(text, projected):
@@ -465,8 +478,8 @@ def add_trigram_annotations(ax, text, projected):
 
     ax.scatter(
         projected[:, 0], projected[:, 1],
-        s=40, c=point_colors, edgecolors="black", linewidths=0.4,
-        alpha=0.92, zorder=4,
+        s=48, c=point_colors, edgecolors="black", linewidths=0.6,
+        zorder=4,
     )
 
     for label, indices in by_sequence.items():
@@ -475,14 +488,14 @@ def add_trigram_annotations(ax, text, projected):
         for point in projected[indices]:
             ax.plot(
                 [text_pos[0], point[0]], [text_pos[1], point[1]],
-                color=color, alpha=0.6, linewidth=0.9, zorder=3,
+                color=color, linewidth=1.4, solid_capstyle="round", zorder=3,
             )
         ax.text(
             text_pos[0], text_pos[1], label,
-            fontsize=10, color=color, ha="center", va="center",
+            fontsize=10, fontweight="bold", color=color, ha="center", va="center",
             bbox=dict(
                 boxstyle="round,pad=0.25", facecolor="white",
-                edgecolor=color, alpha=0.95, linewidth=0.8,
+                edgecolor=color, linewidth=1.2,
             ),
             zorder=5,
         )
@@ -503,7 +516,10 @@ def _expand_limits_for_annotations(ax, projected, text_positions, base_xlim, bas
     ax.set_ylim(min(all_y) - y_pad, max(all_y) + y_pad)
 
 
-def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path, title, xlabel, ylabel):
+def plot_2d_hidden_state_labels(
+    text, hidden_states, chars, projected, save_path, title, xlabel, ylabel,
+    fig_suptitle=None,
+):
     """Scatter points with one prev2+current label per sequence, lines to its points."""
     _ = chars
     if len(text) == 0:
@@ -523,6 +539,8 @@ def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, linestyle=":", alpha=0.35)
+    if fig_suptitle:
+        fig.suptitle(fig_suptitle, fontsize=11, y=1.02)
     fig.savefig(save_path, dpi=300)
     plt.close(fig)
     print(f"wrote {save_path}")
@@ -583,7 +601,10 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
         )
 
     axes[-1].set_xlabel("previous + current character @ timestep")
-    fig.suptitle("Hidden-state representations grouped by input character", y=0.995)
+    fig.suptitle(
+        f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
+        y=0.995,
+    )
     fig.colorbar(last_image, ax=axes, fraction=0.015, pad=0.01, label="activation (tanh)")
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -598,14 +619,15 @@ def plot_pca_context_labels(text, hidden_states, chars, save_path):
         text, hidden_states, chars,
         pca_2d(hidden_states),
         save_path,
-        title="2D PCA (color + label = prev2+current trigram)",
+        title="2D PCA (prev2+current trigram)",
         xlabel="PC1",
         ylabel="PC2",
+        fig_suptitle=original_vocabulary_title(chars, text),
     )
 
 
 def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, grid_resolution=120):
-    """PCA prediction regions with trigram point/label annotations."""
+    """PCA panels: argmax next-char regions and softmax entropy, with trigram labels."""
     n_points, hidden_size = hidden_states.shape
     vocab_size = len(chars)
     if n_points < 2 or hidden_size < 1 or len(text) == 0:
@@ -614,28 +636,56 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
     grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
         text, hidden_states, grid_resolution,
     )
-    grid_pred = argmax_next_char(model, grid_hidden).reshape(grid_resolution, grid_resolution)
+    probs = next_char_probabilities(model, grid_hidden)
+    grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
+    grid_entropy = prediction_entropy(probs).reshape(grid_resolution, grid_resolution)
+    max_entropy = float(np.log(vocab_size))
 
     pred_cmap = plt.get_cmap("tab10", vocab_size)
-    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
-    ax.contourf(
-        grid_x, grid_y, grid_pred,
-        levels=np.arange(-0.5, vocab_size, 1),
-        cmap=pred_cmap, alpha=0.35, antialiased=True, zorder=1,
-    )
+    fig, axes = plt.subplots(1, 2, figsize=(24, 11), constrained_layout=True)
+    panel_specs = [
+        (
+            axes[0],
+            grid_pred,
+            dict(
+                levels=np.arange(-0.5, vocab_size, 1),
+                cmap=pred_cmap,
+                vmin=None,
+                vmax=None,
+            ),
+            "Argmax next-char (2D-reconstructed h)",
+        ),
+        (
+            axes[1],
+            grid_entropy,
+            dict(
+                levels=20,
+                cmap="magma",
+                alpha=0.85,
+                vmin=0.0,
+                vmax=max_entropy,
+            ),
+            f"Prediction entropy (max = ln {vocab_size} ≈ {max_entropy:.2f} nats)",
+        ),
+    ]
 
-    add_trigram_annotations(ax, text, projected)
+    for ax, field, contour_kw, title in panel_specs:
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        im = ax.contourf(grid_x, grid_y, field, antialiased=True, zorder=1, **contour_kw)
+        add_trigram_annotations(ax, text, projected)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_title(title)
+        ax.grid(True, linestyle=":", alpha=0.35)
+        if ax is axes[1]:
+            fig.colorbar(im, ax=ax, label="entropy (nats)", fraction=0.046, pad=0.02)
 
     region_handles = [
-        plt.Rectangle(
-            (0, 0), 1, 1,
-            facecolor=pred_cmap(i), edgecolor="none", alpha=0.35,
-        )
+        plt.Rectangle((0, 0), 1, 1, facecolor=pred_cmap(i), edgecolor="none")
         for i in range(vocab_size)
     ]
-    ax.legend(
+    axes[0].legend(
         region_handles,
         [f"next {display_char(c)!r}" for c in chars],
         title="background region",
@@ -644,14 +694,11 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
         fontsize=8,
     )
 
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title(
-        "PCA: background = argmax next-char (2D-reconstructed h); "
-        "points/lines/labels = prev2+current trigram"
+    fig.suptitle(
+        f"PCA plane (prev2+current trigram) · {original_vocabulary_title(chars, text)}",
+        fontsize=12, y=1.01,
     )
-    ax.grid(True, linestyle=":", alpha=0.35)
-    fig.savefig(save_path, dpi=200)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -708,26 +755,12 @@ def plot_pca_next_char_probability_panels(
 
     fig.colorbar(last_im, ax=axes[:vocab_size], label="probability", shrink=0.92)
     fig.suptitle(
-        "P(next char | 2D-reconstructed h) over PCA plane (one panel per output logit)",
+        f"P(next char | 2D-reconstructed h) over PCA · {original_vocabulary_title(chars, text)}",
         fontsize=11, y=1.02,
     )
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
-
-
-def plot_mds_context_labels(text, hidden_states, chars, save_path):
-    """2D MDS from euclidean distances (same metric as hierarchical clustermap)."""
-    if len(text) < 2:
-        return
-    plot_2d_hidden_state_labels(
-        text, hidden_states, chars,
-        mds_2d(hidden_states),
-        save_path,
-        title="2D MDS (color + label = prev2+current trigram)",
-        xlabel="MDS 1",
-        ylabel="MDS 2",
-    )
 
 
 def char_axis_labels(chars):
@@ -806,7 +839,7 @@ def plot_output_probs(text, output_probs, chars, save_path):
     ax.set_xticklabels(list(text), fontsize=7)
     ax.set_xlabel("timestep / input character")
     ax.set_ylabel("predicted next char")
-    ax.set_title("P(next char | input so far)  --  red dots = actual next char")
+    ax.set_title("P(next char | input so far)  —  red dots = actual next char")
 
     ax.scatter(
         np.arange(length), target_indices,
@@ -882,13 +915,8 @@ def main() -> None:
         save_path=os.path.join(args.out_dir, "hidden_states_pca_next_char_prob_panels.png"),
     )
 
-    plot_mds_context_labels(
-        text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_mds_context_labels.png"),
-    )
-
     plot_hidden_states_clustermap(
-        text, hidden_states,
+        text, hidden_states, model["chars"],
         save_path=os.path.join(args.out_dir, "hidden_states_clustermap.png"),
     )
 
