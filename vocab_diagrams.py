@@ -251,6 +251,76 @@ def minimized_prefix_sets(
     return out
 
 
+@dataclass
+class MinimizedVocabAutomaton:
+    """Minimal DFA for a word vocabulary plus trie prefixes per minimized state."""
+
+    dfa: DFA
+    state_prefixes: dict[int, set[str]]
+
+
+def build_minimized_vocabulary_automaton(words: list[str]) -> MinimizedVocabAutomaton:
+    root = build_trie(words)
+    dfa, old_to_new = minimize_dfa(trie_to_dfa(root))
+    return MinimizedVocabAutomaton(
+        dfa=dfa,
+        state_prefixes=minimized_prefix_sets(root, old_to_new),
+    )
+
+
+def in_word_prefix_since_last_space(text: str, index: int) -> str:
+    """Characters in the current word up to and including `index` (empty on a space)."""
+    if index < 0 or index >= len(text) or text[index] == " ":
+        return ""
+    start = index
+    while start > 0 and text[start - 1] != " ":
+        start -= 1
+    return text[start : index + 1]
+
+
+def walk_dfa_prefix(dfa: DFA, prefix: str) -> int | None:
+    """DFA state after reading `prefix` from the start state (None if undefined)."""
+    state = dfa.start
+    for ch in prefix:
+        nxt = dfa.transition(state, ch)
+        if nxt is None:
+            return None
+        state = nxt
+    return state
+
+
+def dfa_state_at_position(
+    text: str,
+    index: int,
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool,
+) -> int:
+    """
+    Minimized DFA state for this position.
+
+    Spaced corpora: reset at each space; walk only the in-word prefix since that
+    delimiter (the space timestep uses the start state). Unspaced: walk the whole
+    prefix from the beginning of the stream.
+    """
+    if spaced and text[index] == " ":
+        return automaton.dfa.start
+    fragment = (
+        in_word_prefix_since_last_space(text, index)
+        if spaced
+        else text[: index + 1]
+    )
+    state = walk_dfa_prefix(automaton.dfa, fragment)
+    return automaton.dfa.start if state is None else state
+
+
+def dfa_state_label(state: int, automaton: MinimizedVocabAutomaton) -> str:
+    prefixes = automaton.state_prefixes.get(state, set())
+    if prefixes:
+        return format_prefix_set(prefixes)
+    return f"q{state}"
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
@@ -592,6 +662,188 @@ def _marker_defs(lines: list[str]) -> None:
         "</marker>"
     )
     lines.append("</defs>")
+
+
+def _edge_curve_points(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    r1: float,
+    r2: float,
+    curved: float = 0.0,
+) -> tuple[
+    tuple[float, float],
+    tuple[float, float] | None,
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+]:
+    """Start, optional quadratic control, end, label anchor, label normal (SVG coords)."""
+    path, lx, ly, nx, ny = _edge_geometry(x1, y1, x2, y2, r1, r2, curved)
+    tokens = path.replace("M", " ").replace("Q", " ").replace("L", " ").split()
+    vals = [float(v) for v in tokens]
+    if len(vals) == 4:
+        return (vals[0], vals[1]), None, (vals[2], vals[3]), (lx, ly), (nx, ny)
+    if len(vals) == 6:
+        return (
+            (vals[0], vals[1]),
+            (vals[2], vals[3]),
+            (vals[4], vals[5]),
+            (lx, ly),
+            (nx, ny),
+        )
+    raise ValueError(f"unexpected edge path: {path!r}")
+
+
+def _dfa_state_label_map(automaton: MinimizedVocabAutomaton) -> dict[int, set[str]]:
+    dfa = automaton.dfa
+    labels = {s: set(automaton.state_prefixes.get(s, set())) for s in automaton.state_prefixes}
+    states = {dfa.start} | dfa.finals
+    for (s, _), t in dfa.delta.items():
+        states.add(s)
+        states.add(t)
+    for s in states:
+        labels.setdefault(s, set())
+    return labels
+
+
+def draw_minimized_dfa_on_axes(
+    ax,
+    automaton: MinimizedVocabAutomaton,
+    words: list[str],
+    *,
+    state_colors: dict[int, tuple] | None = None,
+) -> None:
+    """Matplotlib rendering of the same layout as `vocabulary_min_dfa.svg`."""
+    from matplotlib.patches import Circle, FancyArrowPatch, PathPatch
+    from matplotlib.path import Path
+
+    dfa = automaton.dfa
+    state_labels = _dfa_state_label_map(automaton)
+    radii = _compute_radii(state_labels)
+    gap_scale = _gap_scale(radii)
+    coords = _scale_positions(layout_dfa(dfa), gap_scale=gap_scale)
+    width, height = _canvas_size(coords, radii)
+
+    ax.set_facecolor(BG_COLOR)
+    ax.set_xlim(0, width)
+    ax.set_ylim(height, 0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    ax.set_title(f"Minimal DFA · {', '.join(words)}", fontsize=12, pad=12)
+
+    by_edge: dict[tuple[int, int], list[str]] = {}
+    for (s, a), t in sorted(dfa.delta.items()):
+        if s in coords and t in coords:
+            by_edge.setdefault((s, t), []).append(a)
+
+    for (s, t), labels in sorted(by_edge.items()):
+        sx, sy = coords[s]
+        tx, ty = coords[t]
+        rs, rt = radii[s], radii[t]
+        for i, label in enumerate(labels):
+            curve = 26 * (i - (len(labels) - 1) / 2.0)
+            start, control, end, (lx, ly), (nx, ny) = _edge_curve_points(
+                sx, sy, tx, ty, rs, rt, curved=curve
+            )
+            if control is None:
+                verts = [start, end]
+                codes = [Path.MOVETO, Path.LINETO]
+            else:
+                verts = [start, control, end]
+                codes = [Path.MOVETO, Path.CURVE3, Path.CURVE3]
+            path = Path(verts, codes)
+            ax.add_patch(
+                PathPatch(
+                    path,
+                    facecolor="none",
+                    edgecolor="#444444",
+                    linewidth=1.2,
+                    zorder=1,
+                )
+            )
+            ex, ey = end
+            if control is None:
+                sx0, sy0 = start
+                dx, dy = ex - sx0, ey - sy0
+            else:
+                cx, cy = control
+                dx, dy = ex - cx, ey - cy
+            norm = math.hypot(dx, dy) or 1.0
+            ax.add_patch(
+                FancyArrowPatch(
+                    (ex - dx / norm * 8, ey - dy / norm * 8),
+                    (ex, ey),
+                    arrowstyle="-|>",
+                    mutation_scale=10,
+                    color="#444444",
+                    linewidth=1.2,
+                    zorder=2,
+                )
+            )
+            side = 1.0 if i % 2 == 0 else -1.0
+            ox = lx + nx * LABEL_OFFSET * side
+            oy = ly + ny * LABEL_OFFSET * side
+            ax.text(
+                ox, oy, label,
+                fontsize=10, ha="center", va="center", color="#222222",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor=BG_COLOR, edgecolor="none"),
+                zorder=3,
+            )
+
+    rx, ry = coords[dfa.start]
+    rr = radii[dfa.start]
+    ax.plot(
+        [rx - rr - 36, rx - rr - 2], [ry, ry],
+        color="#444444", linewidth=1.2, zorder=1,
+    )
+    ax.add_patch(
+        FancyArrowPatch(
+            (rx - rr - 10, ry),
+            (rx - rr - 2, ry),
+            arrowstyle="-|>",
+            mutation_scale=10,
+            color="#444444",
+            linewidth=1.2,
+            zorder=2,
+        )
+    )
+
+    for s in sorted(coords):
+        cx, cy = coords[s]
+        r = radii[s]
+        accepting = s in dfa.finals
+        prefix_set = state_labels.get(s, set())
+        if accepting:
+            ax.add_patch(
+                Circle(
+                    (cx, cy), r + 4,
+                    fill=False, edgecolor="#111111", linewidth=1.5, zorder=4,
+                )
+            )
+        node_fill = state_colors.get(s, NODE_FILL) if state_colors else NODE_FILL
+        ax.add_patch(
+            Circle(
+                (cx, cy), r,
+                facecolor=node_fill, edgecolor="#111111", linewidth=1.5, zorder=5,
+            )
+        )
+        wrapped, _ = _fit_state(prefix_set)
+        fs = _state_font_size(r)
+        if len(wrapped) == 1:
+            ax.text(
+                cx, cy, wrapped[0],
+                fontsize=fs, ha="center", va="center", color="#1a1a1a", zorder=6,
+            )
+        else:
+            block_h = (len(wrapped) - 1) * (LINE_H * 0.85)
+            y0 = cy - block_h / 2
+            for i, line in enumerate(wrapped):
+                ax.text(
+                    cx, y0 + i * LINE_H * 0.85, line,
+                    fontsize=fs, ha="center", va="center", color="#1a1a1a", zorder=6,
+                )
 
 
 def _canvas_size(

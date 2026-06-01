@@ -52,8 +52,10 @@ from __future__ import annotations
 import argparse
 import os
 from collections import defaultdict
+from pathlib import Path
 import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -68,6 +70,11 @@ from experiment import (
 )
 from task import REGIMES
 from vocab_diagrams import (
+    MinimizedVocabAutomaton,
+    build_minimized_vocabulary_automaton,
+    dfa_state_at_position,
+    dfa_state_label,
+    draw_minimized_dfa_on_axes,
     vocabulary_for_experiment,
     write_vocabulary_diagrams,
 )
@@ -272,6 +279,15 @@ def display_char(char):
     if char == " ":
         return "space"
     return char
+
+
+def argmax_region_glyph(char: str) -> str | None:
+    """Single visible glyph for an argmax region label (None = skip region)."""
+    if char == " ":
+        return "␣"
+    if len(char) == 1:
+        return char
+    return None
 
 
 def corpus_uses_word_spacing(text: str, exp_name: str | None = None) -> bool:
@@ -487,14 +503,22 @@ def trigram_sequence_colors(labels):
     return {label: cmap(i) for i, label in enumerate(unique_labels)}
 
 
-def layout_trigram_labels(text, projected, *, spaced: bool = False):
-    """Label positions and grouping for context annotations on PCA plots."""
-    labels = [timestep_context_label(text, i, spaced=spaced) for i in range(len(text))]
-    sequence_color = trigram_sequence_colors(labels)
-    by_sequence = defaultdict(list)
-    for i, label in enumerate(labels):
-        by_sequence[label].append(i)
+def _state_id_colors(state_ids: list[int]) -> dict[int, tuple]:
+    unique = sorted(set(state_ids))
+    cmap = plt.get_cmap("tab20", max(len(unique), 1))
+    return {state: cmap(i) for i, state in enumerate(unique)}
 
+
+def prefix_annotation_label(text: str, index: int, *, spaced: bool) -> str:
+    """Text on annotation boxes: in-word prefix since last space, or stream prefix."""
+    if spaced:
+        return word_subsequent_label(text, index)
+    return text[: index + 1]
+
+
+def _layout_group_label_positions(
+    projected, groups: dict[str, list[int]]
+) -> dict[str, np.ndarray]:
     center = projected.mean(axis=0)
     span = max(
         float(np.ptp(projected[:, 0])),
@@ -503,8 +527,7 @@ def layout_trigram_labels(text, projected, *, spaced: bool = False):
     )
     label_offset = span * 0.14
     label_positions = {}
-
-    for label, indices in by_sequence.items():
+    for key, indices in groups.items():
         points = projected[indices]
         centroid = points.mean(axis=0)
         outward = centroid - center
@@ -513,8 +536,18 @@ def layout_trigram_labels(text, projected, *, spaced: bool = False):
             outward = np.array([0.0, 1.0])
         else:
             outward = outward / norm
-        label_positions[label] = centroid + outward * label_offset
+        label_positions[key] = centroid + outward * label_offset
+    return label_positions
 
+
+def layout_trigram_labels(text, projected, *, spaced: bool = False):
+    """Label positions and grouping for context annotations on PCA plots."""
+    labels = [timestep_context_label(text, i, spaced=spaced) for i in range(len(text))]
+    sequence_color = trigram_sequence_colors(labels)
+    by_sequence: dict[str, list[int]] = defaultdict(list)
+    for i, label in enumerate(labels):
+        by_sequence[label].append(i)
+    label_positions = _layout_group_label_positions(projected, by_sequence)
     return labels, sequence_color, by_sequence, label_positions
 
 
@@ -540,30 +573,31 @@ def _context_annotation_effects():
     ]
 
 
-def add_trigram_annotations(ax, text, projected, *, spaced: bool = False):
-    """Context-colored points, leader lines, one label per context group."""
-    labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(
-        text, projected, spaced=spaced
-    )
-    point_colors = [sequence_color[label] for label in labels]
-
+def _draw_annotation_groups(
+    ax,
+    projected,
+    groups: dict,
+    label_positions: dict,
+    point_colors: list,
+    label_text: dict,
+) -> list[tuple[float, float]]:
+    """Scatter + leader lines + one label per group (shared by trigram / DFA modes)."""
     ax.scatter(
         projected[:, 0], projected[:, 1],
         s=40, c=point_colors, edgecolors="black", linewidths=0.5,
         zorder=6,
     )
 
-    for label, indices in by_sequence.items():
-        text_pos = label_positions[label]
-        color = sequence_color[label]
+    for key, indices in groups.items():
+        text_pos = label_positions[key]
+        color = point_colors[indices[0]]
         for point in projected[indices]:
             ax.plot(
                 [text_pos[0], point[0]], [text_pos[1], point[1]],
                 color=color, linewidth=1.4, solid_capstyle="round", zorder=5,
             )
-        display = "␣" if label == " " else label
         ax.text(
-            text_pos[0], text_pos[1], display,
+            text_pos[0], text_pos[1], label_text[key],
             fontsize=CONTEXT_LABEL_FONTSIZE, color="#1a1a1a",
             ha="center", va="center",
             bbox=_context_annotation_bbox(color),
@@ -572,6 +606,93 @@ def add_trigram_annotations(ax, text, projected, *, spaced: bool = False):
         )
 
     return list(label_positions.values())
+
+
+def _add_dfa_state_color_legend(
+    ax, automaton: MinimizedVocabAutomaton, state_colors: dict[int, tuple]
+) -> None:
+    handles = [
+        Patch(
+            facecolor=state_colors[state],
+            edgecolor="#333333",
+            label=dfa_state_label(state, automaton),
+        )
+        for state in sorted(state_colors)
+    ]
+    ax.legend(
+        handles=handles,
+        title="min DFA state",
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        fontsize=7,
+        title_fontsize=8,
+        framealpha=0.95,
+        borderaxespad=0.0,
+    )
+
+
+def add_dfa_state_annotations(
+    ax,
+    text,
+    projected,
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool,
+    state_colors: dict[int, tuple] | None = None,
+    show_legend: bool = False,
+):
+    """Point color = min DFA state; annotation text = prefix since last space."""
+    n = len(text)
+    state_ids = [
+        dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(n)
+    ]
+    prefixes = [
+        prefix_annotation_label(text, i, spaced=spaced) for i in range(n)
+    ]
+    if state_colors is None:
+        state_colors = _state_id_colors(state_ids)
+    point_colors = [state_colors[s] for s in state_ids]
+
+    by_prefix: dict[str, list[int]] = defaultdict(list)
+    for i, prefix in enumerate(prefixes):
+        by_prefix[prefix].append(i)
+    label_positions = _layout_group_label_positions(projected, by_prefix)
+    label_text = {p: ("␣" if p == " " else p) for p in by_prefix}
+
+    text_positions = _draw_annotation_groups(
+        ax, projected, by_prefix, label_positions, point_colors, label_text
+    )
+    if show_legend:
+        _add_dfa_state_color_legend(ax, automaton, state_colors)
+    return text_positions
+
+
+def add_trigram_annotations(ax, text, projected, *, spaced: bool = False):
+    """Context-colored points, leader lines, one label per context group."""
+    labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(
+        text, projected, spaced=spaced
+    )
+    label_text = {"␣" if label == " " else label for label in by_sequence}
+    point_colors = [sequence_color[label] for label in labels]
+    return _draw_annotation_groups(
+        ax, projected, by_sequence, label_positions, point_colors, label_text
+    )
+
+
+def add_pca_point_annotations(
+    ax,
+    text,
+    projected,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+    show_dfa_legend: bool = False,
+):
+    if automaton is not None:
+        return add_dfa_state_annotations(
+            ax, text, projected, automaton, spaced=spaced, show_legend=show_dfa_legend
+        )
+    return add_trigram_annotations(ax, text, projected, spaced=spaced)
 
 
 def _expand_limits_for_annotations(ax, projected, text_positions, base_xlim, base_ylim):
@@ -599,6 +720,7 @@ def plot_2d_hidden_state_labels(
     fig_suptitle=None,
     *,
     spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
 ):
     """Scatter points with one context label per group, lines to its points."""
     _ = chars
@@ -606,7 +728,9 @@ def plot_2d_hidden_state_labels(
         return
 
     fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
-    text_positions = add_trigram_annotations(ax, text, projected, spaced=spaced)
+    text_positions = add_pca_point_annotations(
+        ax, text, projected, spaced=spaced, automaton=automaton
+    )
     _expand_limits_for_annotations(
         ax, projected, text_positions,
         (projected[:, 0].min(), projected[:, 0].max()),
@@ -697,9 +821,22 @@ def plot_per_char_hidden_state_heatmaps(
     print(f"wrote {save_path}")
 
 
-def trigram_avoidance_points(text, projected, *, spaced: bool = False):
+def trigram_avoidance_points(
+    text,
+    projected,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+):
     """PC coordinates to keep region letters away from (scatter + label boxes)."""
-    _, _, _, label_positions = layout_trigram_labels(text, projected, spaced=spaced)
+    if automaton is not None:
+        prefixes = [prefix_annotation_label(text, i, spaced=spaced) for i in range(len(text))]
+        by_prefix: dict[str, list[int]] = defaultdict(list)
+        for i, prefix in enumerate(prefixes):
+            by_prefix[prefix].append(i)
+        label_positions = _layout_group_label_positions(projected, by_prefix)
+    else:
+        _, _, _, label_positions = layout_trigram_labels(text, projected, spaced=spaced)
     blocks = [projected]
     if label_positions:
         blocks.append(np.array(list(label_positions.values())))
@@ -789,11 +926,11 @@ def add_argmax_region_labels(
         )
         if position is None:
             continue
-        letter = display_char(char)
-        if len(letter) != 1:
+        glyph = argmax_region_glyph(char)
+        if glyph is None:
             continue
         ax.text(
-            position[0], position[1], letter,
+            position[0], position[1], glyph,
             fontsize=26, color="white",
             ha="center", va="center", zorder=8,
             path_effects=[
@@ -804,16 +941,27 @@ def add_argmax_region_labels(
 
 
 def plot_pca_context_labels(
-    text, hidden_states, chars, save_path, *, spaced: bool = False
+    text,
+    hidden_states,
+    chars,
+    save_path,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
 ):
     """2D PCA of hidden states with context labels."""
     if len(text) < 1:
         return
-    title = (
-        "2D PCA (prefix after space)"
-        if spaced
-        else "2D PCA (prev2+current, 3-char)"
-    )
+    if automaton is not None:
+        title = "2D PCA (min DFA state · prefix since last space)" if spaced else (
+            "2D PCA (min DFA state)"
+        )
+    else:
+        title = (
+            "2D PCA (prefix after space)"
+            if spaced
+            else "2D PCA (prev2+current, 3-char)"
+        )
     plot_2d_hidden_state_labels(
         text, hidden_states, chars,
         pca_2d(hidden_states),
@@ -823,7 +971,59 @@ def plot_pca_context_labels(
         ylabel="PC2",
         fig_suptitle=original_vocabulary_title(chars, text),
         spaced=spaced,
+        automaton=automaton,
     )
+
+
+def plot_pca_dfa_analysis(
+    text,
+    hidden_states,
+    chars,
+    words: list[str],
+    save_path,
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool = False,
+):
+    """Plain PCA (DFA-colored points) beside the min-DFA with matching state colors."""
+    if len(text) < 2:
+        return
+
+    projected = pca_2d(hidden_states)
+    state_ids = [
+        dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(len(text))
+    ]
+    state_colors = _state_id_colors(state_ids)
+
+    fig, axes = plt.subplots(1, 2, figsize=(28, 11), constrained_layout=True)
+    ax_pca, ax_dfa = axes
+
+    text_positions = add_dfa_state_annotations(
+        ax_pca, text, projected, automaton,
+        spaced=spaced, state_colors=state_colors,
+    )
+    _expand_limits_for_annotations(
+        ax_pca, projected, text_positions,
+        (projected[:, 0].min(), projected[:, 0].max()),
+        (projected[:, 1].min(), projected[:, 1].max()),
+    )
+    ax_pca.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax_pca.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax_pca.set_xlabel("PC1")
+    ax_pca.set_ylabel("PC2")
+    ctx = "prefix since last space" if spaced else "stream prefix"
+    ax_pca.set_title(f"2D PCA (min DFA state · {ctx})")
+    ax_pca.grid(True, linestyle=":", alpha=0.35)
+
+    draw_minimized_dfa_on_axes(ax_dfa, automaton, words, state_colors=state_colors)
+
+    fig.suptitle(
+        f"Hidden states vs vocabulary DFA · {original_vocabulary_title(chars, text)}",
+        fontsize=12, y=1.01,
+    )
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
 
 
 def plot_pca_prediction_regions(
@@ -835,6 +1035,7 @@ def plot_pca_prediction_regions(
     grid_resolution=120,
     *,
     spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
 ):
     """PCA panels: argmax next-char regions and softmax entropy, with context labels."""
     n_points, hidden_size = hidden_states.shape
@@ -849,7 +1050,9 @@ def plot_pca_prediction_regions(
     grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
     grid_entropy = prediction_entropy(probs).reshape(grid_resolution, grid_resolution)
     max_entropy = float(np.log(vocab_size))
-    avoid_xy = trigram_avoidance_points(text, projected, spaced=spaced)
+    avoid_xy = trigram_avoidance_points(
+        text, projected, spaced=spaced, automaton=automaton
+    )
     plane_span = max(
         float(np.ptp(grid_x)),
         float(np.ptp(grid_y)),
@@ -897,7 +1100,9 @@ def plot_pca_prediction_regions(
                 avoid_xy=avoid_xy, avoid_radius=avoid_radius,
                 xlim=xlim, ylim=ylim,
             )
-        add_trigram_annotations(ax, text, projected, spaced=spaced)
+        add_pca_point_annotations(
+            ax, text, projected, spaced=spaced, automaton=automaton
+        )
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_title(title)
@@ -905,7 +1110,10 @@ def plot_pca_prediction_regions(
         if ax is axes[1]:
             fig.colorbar(im, ax=ax, label="entropy (nats)", fraction=0.046, pad=0.02)
 
-    pca_ctx = "prefix after space" if spaced else "prev2+current, 3-char"
+    if automaton is not None:
+        pca_ctx = "min DFA state (prefix since last space)" if spaced else "min DFA state"
+    else:
+        pca_ctx = "prefix after space" if spaced else "prev2+current, 3-char"
     fig.suptitle(
         f"PCA plane ({pca_ctx}) · {original_vocabulary_title(chars, text)}",
         fontsize=12, y=1.01,
@@ -1113,7 +1321,15 @@ def main() -> None:
     print(f"running forward pass over {len(text)} characters of {input_file}")
 
     spaced = corpus_uses_word_spacing(text, args.exp)
-    if spaced:
+    words = vocabulary_for_experiment(args.exp) if args.exp else infer_task_words(text)
+    automaton = build_minimized_vocabulary_automaton(words) if words else None
+    if automaton is not None:
+        print(
+            "PCA point colors: minimized DFA state after in-word prefix since last space"
+            if spaced
+            else "PCA point colors: minimized DFA state (stream prefix)"
+        )
+    elif spaced:
         print("annotation mode: prefix after space (e.g. h, ha, hat; ' ' on spaces)")
 
     hidden_states, output_probs = forward_pass(model, text)
@@ -1140,13 +1356,23 @@ def main() -> None:
         text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_pca_context_labels.png"),
         spaced=spaced,
+        automaton=automaton,
     )
 
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_pca_prediction_regions.png"),
         spaced=spaced,
+        automaton=automaton,
     )
+
+    if automaton is not None and words:
+        plot_pca_dfa_analysis(
+            text, hidden_states, model["chars"], words,
+            save_path=os.path.join(out_dir, "hidden_states_pca_dfa_analysis.png"),
+            automaton=automaton,
+            spaced=spaced,
+        )
 
     plot_pca_next_char_probability_panels(
         model, text, hidden_states, model["chars"],
@@ -1180,7 +1406,6 @@ def main() -> None:
     print(f"top-1 next-char accuracy over the {len(text)}-char window: "
           f"{correct}/{len(text)} = {100*correct/len(text):.1f}%")
 
-    words = vocabulary_for_experiment(args.exp) if args.exp else infer_task_words(text)
     if words:
         trie_path, dfa_path = write_vocabulary_diagrams(words, Path(out_dir))
         print(f"wrote {trie_path}")
