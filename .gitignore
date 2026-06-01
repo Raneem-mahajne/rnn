@@ -1,4 +1,6 @@
 input.txt
+experiments/*/input.txt
+experiments/*/model.npz
 
 __pycache__/
 *.pyc

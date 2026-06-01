@@ -13,12 +13,15 @@ Usage:
     python task.py disjoint_letters --chars 200000
     python task.py one_word
     python task.py ten_word_overlap --chars 50000
+    python task.py shared_letters --exp shared_letters   # -> experiments/shared_letters/input.txt
 """
 
 from __future__ import annotations
 
 import argparse
 import random
+
+from experiment import input_path as experiment_input_path
 
 REGIMES: dict[str, list[str]] = {
     "one_word":         ["cat"],
@@ -49,19 +52,28 @@ def main() -> None:
     parser.add_argument("--chars", type=int, default=50,
                         help="total characters to emit (default: 50)")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", default="input.txt")
+    parser.add_argument("--exp", default=None,
+                        help="experiment name (default: regime); writes experiments/<exp>/input.txt")
+    parser.add_argument("--out", default=None,
+                        help="output path (overrides --exp)")
     args = parser.parse_args()
+
+    out_path = args.out
+    if out_path is None:
+        exp_name = args.exp or args.regime
+        out_path = str(experiment_input_path(exp_name))
+        experiment_input_path(exp_name).parent.mkdir(parents=True, exist_ok=True)
 
     words = REGIMES[args.regime]
     text = generate_sequence(words, args.chars, seed=args.seed)
-    with open(args.out, "w") as f:
+    with open(out_path, "w") as f:
         f.write(text)
 
     vocab = sorted(set(text))
     print(f"Regime:  {args.regime}")
     print(f"Words:   {words}")
     print(f"Vocab:   {''.join(vocab)} ({len(vocab)} symbols)")
-    print(f"Wrote:   {args.out} ({len(text):,} characters)")
+    print(f"Wrote:   {out_path} ({len(text):,} characters)")
     print(f"Preview: {text[:80]}")
 
 

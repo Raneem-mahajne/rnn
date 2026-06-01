@@ -42,9 +42,9 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
 Usage:
-    python visualize.py                  # default: 50 chars
-    python visualize.py --length 80
-    python visualize.py --length 50 --out-dir plots
+    python visualize.py --exp shared_letters
+    python visualize.py --exp ten_word_overlap --length 100
+    python visualize.py --model path/to/model.npz --input path/to/input.txt --out-dir path/to/plots
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ import pandas as pd
 import seaborn as sns
 from scipy import ndimage
 
+from experiment import ensure_experiment_dirs, input_path, model_path, plots_dir
 from task import REGIMES
 
 
@@ -960,71 +961,90 @@ def plot_output_probs(text, output_probs, chars, save_path):
     print(f"wrote {save_path}")
 
 
+def resolve_paths(args):
+    """Return (model_path, input_path, out_dir) from --exp or explicit paths."""
+    if args.exp:
+        ensure_experiment_dirs(args.exp)
+        return (
+            str(model_path(args.exp)),
+            str(input_path(args.exp)),
+            str(plots_dir(args.exp)),
+        )
+    out = args.out_dir if args.out_dir is not None else "plots"
+    return args.model, args.input, out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--exp", default=None,
+                        help="experiment name under experiments/<exp>/")
     parser.add_argument("--model", default="model.npz")
     parser.add_argument("--input", default="input.txt")
     parser.add_argument("--length", type=int, default=50,
                         help="how many characters of the corpus to visualize (default: 50)")
-    parser.add_argument("--out-dir", default="plots")
+    parser.add_argument("--out-dir", default=None,
+                        help="plot output directory (default: experiments/<exp>/plots or plots)")
     parser.add_argument("--no-cluster-per-char", action="store_true",
                         help="keep per-character heatmap rows in sequence order")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    model_file, input_file, out_dir = resolve_paths(args)
+    os.makedirs(out_dir, exist_ok=True)
+    if args.exp:
+        print(f"experiment: {args.exp} -> {out_dir}")
 
-    model = load_model(args.model)
+    model = load_model(model_file)
     print(f"loaded model: hidden_size={model['hidden_size']}, "
           f"vocab_size={model['vocab_size']}, chars={''.join(model['chars'])}")
 
-    plot_learned_weights(model, args.out_dir)
+    plot_learned_weights(model, out_dir)
     plot_learning_curve(
         model,
-        save_path=os.path.join(args.out_dir, "learning_curve.png"),
+        save_path=os.path.join(out_dir, "learning_curve.png"),
     )
 
-    with open(args.input, "r") as f:
+    with open(input_file, "r") as f:
         text = f.read()[: args.length]
-    print(f"running forward pass over {len(text)} characters of {args.input}")
+    print(f"running forward pass over {len(text)} characters of {input_file}")
 
     hidden_states, output_probs = forward_pass(model, text)
     targets = list(text[1:]) + [text[0]]
 
     plot_hidden_states_heatmap(
         text, hidden_states,
-        save_path=os.path.join(args.out_dir, "hidden_states_heatmap.png"),
+        save_path=os.path.join(out_dir, "hidden_states_heatmap.png"),
     )
 
     plot_output_probs(
         text, output_probs, model["chars"],
-        save_path=os.path.join(args.out_dir, "output_probabilities.png"),
+        save_path=os.path.join(out_dir, "output_probabilities.png"),
     )
 
     plot_per_char_hidden_state_heatmaps(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_by_input_char.png"),
+        save_path=os.path.join(out_dir, "hidden_states_by_input_char.png"),
         cluster_rows=not args.no_cluster_per_char,
     )
 
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_pca_context_labels.png"),
+        save_path=os.path.join(out_dir, "hidden_states_pca_context_labels.png"),
     )
 
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_pca_prediction_regions.png"),
+        save_path=os.path.join(out_dir, "hidden_states_pca_prediction_regions.png"),
     )
 
     plot_pca_next_char_probability_panels(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_pca_next_char_prob_panels.png"),
+        save_path=os.path.join(out_dir, "hidden_states_pca_next_char_prob_panels.png"),
     )
 
     plot_hidden_states_clustermap(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(args.out_dir, "hidden_states_clustermap.png"),
+        save_path=os.path.join(out_dir, "hidden_states_clustermap.png"),
     )
 
     if model["hidden_size"] == 2:
@@ -1033,14 +1053,14 @@ def main() -> None:
             color_by_chars=list(text),
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by INPUT char)",
-            save_path=os.path.join(args.out_dir, "hidden_states_trajectory.png"),
+            save_path=os.path.join(out_dir, "hidden_states_trajectory.png"),
         )
         plot_state_trajectory(
             hidden_states,
             color_by_chars=targets,
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by TARGET / next char)",
-            save_path=os.path.join(args.out_dir, "hidden_states_by_target.png"),
+            save_path=os.path.join(out_dir, "hidden_states_by_target.png"),
         )
 
     correct = np.sum(np.argmax(output_probs, axis=1) ==

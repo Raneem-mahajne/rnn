@@ -19,15 +19,21 @@ Recurrence (forward):
   loss_at_t        = -log(output_probs[t][target_index])
 """
 import argparse
+import os
+
 import numpy as np
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--steps', type=int, default=2000,
                     help='training iterations (default: 2000)')
+parser.add_argument('--input', default='input.txt',
+                    help='training corpus path (default: input.txt)')
+parser.add_argument('--model', default='model.npz',
+                    help='where to save trained weights (default: model.npz)')
 args = parser.parse_args()
 
 # ----- data I/O ---------------------------------------------------------------
-text = open('input.txt', 'r').read()                # entire training corpus as one string
+text = open(args.input, 'r').read()                 # entire training corpus as one string
 unique_chars = list(set(text))                       # character vocabulary (order is arbitrary)
 text_length, vocab_size = len(text), len(unique_chars)
 print('data has %d characters, %d unique.' % (text_length, vocab_size))
@@ -277,8 +283,12 @@ print('----\n %s \n----' % (sampled_text,))
 print('iter %d, loss: %f (done)' % (iteration, smooth_loss))
 
 # Save trained parameters and vocab so we can inspect/visualize the model later.
+model_out = args.model
+model_out_parent = os.path.dirname(model_out)
+if model_out_parent:
+    os.makedirs(model_out_parent, exist_ok=True)
 np.savez(
-    'model.npz',
+    model_out,
     weights_input_to_hidden=weights_input_to_hidden,
     weights_hidden_to_hidden=weights_hidden_to_hidden,
     weights_hidden_to_output=weights_hidden_to_output,
@@ -291,4 +301,4 @@ np.savez(
     loss_smooth=np.array(loss_smooth, dtype=np.float64),
     loss_window=np.array(loss_window, dtype=np.float64),
 )
-print('saved trained model to model.npz')
+print(f'saved trained model to {model_out}')
