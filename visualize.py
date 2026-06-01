@@ -52,10 +52,13 @@ from __future__ import annotations
 import argparse
 import os
 from collections import defaultdict
+import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy import ndimage
+
 from task import REGIMES
 
 
@@ -611,6 +614,109 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
     print(f"wrote {save_path}")
 
 
+def trigram_avoidance_points(text, projected):
+    """PC coordinates to keep region letters away from (scatter + label boxes)."""
+    _, _, _, label_positions = layout_trigram_labels(text, projected)
+    blocks = [projected]
+    if label_positions:
+        blocks.append(np.array(list(label_positions.values())))
+    return np.vstack(blocks)
+
+
+def region_interior_point(
+    grid_x, grid_y, class_mask,
+    avoid_xy=None, avoid_radius=0.0,
+    xlim=None, ylim=None, edge_margin_frac=0.08,
+    min_area_frac=0.02, erosion_iters=4,
+):
+    """Point deep inside the largest argmax blob, away from labels and plot edges."""
+    if not class_mask.any():
+        return None
+
+    labeled, num_features = ndimage.label(class_mask)
+    if num_features == 0:
+        return None
+
+    component_sizes = ndimage.sum(
+        class_mask, labeled, index=np.arange(1, num_features + 1),
+    )
+    largest_label = 1 + int(np.argmax(component_sizes))
+    component = labeled == largest_label
+
+    if component.sum() < min_area_frac * class_mask.size:
+        return None
+
+    interior = component
+    for _ in range(erosion_iters):
+        shrunk = ndimage.binary_erosion(interior)
+        if shrunk.any():
+            interior = shrunk
+
+    depth = ndimage.distance_transform_edt(interior)
+    if depth.max() < 1.0:
+        return None
+
+    rows, cols = np.where(interior)
+    depth_vals = depth[rows, cols]
+    gx = grid_x[rows, cols]
+    gy = grid_y[rows, cols]
+
+    if avoid_xy is not None and len(avoid_xy):
+        avoid = np.asarray(avoid_xy, dtype=float)
+        diff = np.stack([gx, gy], axis=1)[:, None, :] - avoid[None, :, :]
+        clearance = np.linalg.norm(diff, axis=2).min(axis=1) - avoid_radius
+        clearance = np.maximum(clearance, 0.0)
+    else:
+        clearance = np.ones(len(rows), dtype=float)
+
+    if xlim is not None and ylim is not None:
+        plane_span = max(float(xlim[1] - xlim[0]), float(ylim[1] - ylim[0]), 1e-3)
+        margin = plane_span * edge_margin_frac
+        edge_clear = np.minimum(
+            np.minimum(gx - xlim[0], xlim[1] - gx),
+            np.minimum(gy - ylim[0], ylim[1] - gy),
+        ) - margin
+        edge_clear = np.maximum(edge_clear, 0.0)
+    else:
+        edge_clear = np.ones(len(rows), dtype=float)
+
+    score = depth_vals * np.sqrt(clearance + 1e-6) * edge_clear
+    if score.max() <= 0:
+        return None
+
+    best = int(np.argmax(score))
+    row, col = rows[best], cols[best]
+    return float(grid_x[row, col]), float(grid_y[row, col])
+
+
+def add_argmax_region_labels(
+    ax, grid_x, grid_y, grid_pred, chars,
+    avoid_xy=None, avoid_radius=0.0, xlim=None, ylim=None,
+):
+    """Large white letter at the interior of each argmax region."""
+    stroke = path_effects.withStroke(linewidth=4, foreground="#1a1a1a")
+    for index, char in enumerate(chars):
+        mask = grid_pred == index
+        if not mask.any():
+            continue
+        position = region_interior_point(
+            grid_x, grid_y, mask,
+            avoid_xy=avoid_xy, avoid_radius=avoid_radius,
+            xlim=xlim, ylim=ylim,
+        )
+        if position is None:
+            continue
+        letter = display_char(char)
+        if len(letter) != 1:
+            continue
+        ax.text(
+            position[0], position[1], letter,
+            fontsize=34, fontweight="bold", color="white",
+            ha="center", va="center", zorder=6,
+            path_effects=[stroke],
+        )
+
+
 def plot_pca_context_labels(text, hidden_states, chars, save_path):
     """2D PCA of hidden states; labels show prev2 + current char."""
     if len(text) < 1:
@@ -640,6 +746,15 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
     grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
     grid_entropy = prediction_entropy(probs).reshape(grid_resolution, grid_resolution)
     max_entropy = float(np.log(vocab_size))
+    avoid_xy = trigram_avoidance_points(text, projected)
+    plane_span = max(
+        float(np.ptp(grid_x)),
+        float(np.ptp(grid_y)),
+        float(np.ptp(projected[:, 0])),
+        float(np.ptp(projected[:, 1])),
+        1e-3,
+    )
+    avoid_radius = plane_span * 0.12
 
     pred_cmap = plt.get_cmap("tab10", vocab_size)
     fig, axes = plt.subplots(1, 2, figsize=(24, 11), constrained_layout=True)
@@ -673,6 +788,12 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         im = ax.contourf(grid_x, grid_y, field, antialiased=True, zorder=1, **contour_kw)
+        if ax is axes[0]:
+            add_argmax_region_labels(
+                ax, grid_x, grid_y, grid_pred, chars,
+                avoid_xy=avoid_xy, avoid_radius=avoid_radius,
+                xlim=xlim, ylim=ylim,
+            )
         add_trigram_annotations(ax, text, projected)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
