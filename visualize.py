@@ -27,14 +27,17 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
   6) hidden_states_pca_context_labels.png
        2D PCA of hidden states; annotation = prev2 + current char.
 
-  7) hidden_states_mds_context_labels.png
+  7) hidden_states_pca_prediction_regions.png
+       PCA plane colored by argmax next-char prediction (2D reconstruction).
+
+  8) hidden_states_mds_context_labels.png
        2D MDS from the same euclidean distances as the clustermap dendrogram.
 
-  8) hidden_states_clustermap.png
+  9) hidden_states_clustermap.png
        Heatmap of timesteps × hidden units with row/column dendrograms
        (average linkage). Row labels: two preceding chars + current char.
 
-  9) weights.png
+  10) weights.png
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
@@ -312,12 +315,32 @@ def plot_hidden_states_clustermap(text, hidden_states, save_path):
     print(f"wrote {save_path}")
 
 
+def fit_pca_2d(points):
+    """PCA fit: return 2D coords, mean, and (2, D) principal axes for reconstruction."""
+    mean = np.mean(points, axis=0)
+    centered = points - mean
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    components = vh[:2]
+    coords = centered @ components.T
+    return coords, mean, components
+
+
 def pca_2d(points):
     """Project points to two dimensions with PCA using NumPy's SVD."""
-    centered = points - np.mean(points, axis=0, keepdims=True)
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    components = vh[:2].T
-    return centered @ components
+    return fit_pca_2d(points)[0]
+
+
+def reconstruct_from_pca(coords, mean, components):
+    """Approximate hidden states from PC1/PC2 (other PCs set to zero)."""
+    return mean + coords @ components
+
+
+def argmax_next_char(model, hidden_states):
+    """Most likely next character index for each row of hidden_states."""
+    weights = model["weights_hidden_to_output"]
+    bias = model["bias_output"].ravel()
+    logits = hidden_states @ weights.T + bias
+    return np.argmax(logits, axis=1)
 
 
 def mds_2d(points):
@@ -356,22 +379,20 @@ def plot_learning_curve(model, save_path):
     print(f"wrote {save_path}")
 
 
-def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path, title, xlabel, ylabel):
-    """Scatter points with one prev2+current label per sequence, lines to its points."""
-    _ = chars
-    if len(text) == 0:
-        return
-
-    labels = [timestep_context_label(text, i) for i in range(len(text))]
+def trigram_sequence_colors(labels):
+    """Stable color per unique prev2+current label."""
     unique_labels = sorted(set(labels))
     cmap = plt.get_cmap("tab20" if len(unique_labels) <= 20 else "hsv")
-    sequence_color = {
+    return {
         label: cmap(i / max(len(unique_labels) - 1, 1))
         for i, label in enumerate(unique_labels)
     }
 
-    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
 
+def layout_trigram_labels(text, projected):
+    """Label positions and grouping for prev2+current annotations."""
+    labels = [timestep_context_label(text, i) for i in range(len(text))]
+    sequence_color = trigram_sequence_colors(labels)
     by_sequence = defaultdict(list)
     for i, label in enumerate(labels):
         by_sequence[label].append(i)
@@ -383,17 +404,10 @@ def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path
         1e-3,
     )
     label_offset = span * 0.14
-    text_positions = []
+    label_positions = {}
 
     for label, indices in by_sequence.items():
-        color = sequence_color[label]
         points = projected[indices]
-        ax.scatter(
-            points[:, 0], points[:, 1],
-            s=36, color=color, edgecolors="black", linewidths=0.35,
-            alpha=0.8, zorder=3,
-        )
-
         centroid = points.mean(axis=0)
         outward = centroid - center
         norm = float(np.linalg.norm(outward))
@@ -401,30 +415,69 @@ def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path
             outward = np.array([0.0, 1.0])
         else:
             outward = outward / norm
-        text_pos = centroid + outward * label_offset
-        text_positions.append(text_pos)
+        label_positions[label] = centroid + outward * label_offset
 
-        for point in points:
+    return labels, sequence_color, by_sequence, label_positions
+
+
+def add_trigram_annotations(ax, text, projected):
+    """Trigram-colored points, leader lines, one label per prev2+current sequence."""
+    labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(text, projected)
+    point_colors = [sequence_color[label] for label in labels]
+
+    ax.scatter(
+        projected[:, 0], projected[:, 1],
+        s=40, c=point_colors, edgecolors="black", linewidths=0.4,
+        alpha=0.92, zorder=4,
+    )
+
+    for label, indices in by_sequence.items():
+        text_pos = label_positions[label]
+        color = sequence_color[label]
+        for point in projected[indices]:
             ax.plot(
                 [text_pos[0], point[0]], [text_pos[1], point[1]],
-                color=color, alpha=0.5, linewidth=0.9, zorder=1,
+                color=color, alpha=0.6, linewidth=0.9, zorder=3,
             )
         ax.text(
             text_pos[0], text_pos[1], label,
             fontsize=10, color=color, ha="center", va="center",
             bbox=dict(
                 boxstyle="round,pad=0.25", facecolor="white",
-                edgecolor=color, alpha=0.9, linewidth=0.8,
+                edgecolor=color, alpha=0.95, linewidth=0.8,
             ),
-            zorder=4,
+            zorder=5,
         )
 
-    all_x = np.concatenate([projected[:, 0], [p[0] for p in text_positions]])
-    all_y = np.concatenate([projected[:, 1], [p[1] for p in text_positions]])
-    x_pad = max((all_x.max() - all_x.min()) * 0.1, 1e-3)
-    y_pad = max((all_y.max() - all_y.min()) * 0.1, 1e-3)
-    ax.set_xlim(all_x.min() - x_pad, all_x.max() + x_pad)
-    ax.set_ylim(all_y.min() - y_pad, all_y.max() + y_pad)
+    return list(label_positions.values())
+
+
+def _expand_limits_for_annotations(ax, projected, text_positions, base_xlim, base_ylim):
+    """Union of grid limits and annotation positions."""
+    all_x = [projected[:, 0].min(), projected[:, 0].max(), base_xlim[0], base_xlim[1]]
+    all_y = [projected[:, 1].min(), projected[:, 1].max(), base_ylim[0], base_ylim[1]]
+    if text_positions:
+        all_x.extend(p[0] for p in text_positions)
+        all_y.extend(p[1] for p in text_positions)
+    x_pad = max((max(all_x) - min(all_x)) * 0.1, 1e-3)
+    y_pad = max((max(all_y) - min(all_y)) * 0.1, 1e-3)
+    ax.set_xlim(min(all_x) - x_pad, max(all_x) + x_pad)
+    ax.set_ylim(min(all_y) - y_pad, max(all_y) + y_pad)
+
+
+def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path, title, xlabel, ylabel):
+    """Scatter points with one prev2+current label per sequence, lines to its points."""
+    _ = chars
+    if len(text) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    text_positions = add_trigram_annotations(ax, text, projected)
+    _expand_limits_for_annotations(
+        ax, projected, text_positions,
+        (projected[:, 0].min(), projected[:, 0].max()),
+        (projected[:, 1].min(), projected[:, 1].max()),
+    )
 
     ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
@@ -511,6 +564,79 @@ def plot_pca_context_labels(text, hidden_states, chars, save_path):
         xlabel="PC1",
         ylabel="PC2",
     )
+
+
+def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, grid_resolution=120):
+    """PCA prediction regions with trigram point/label annotations."""
+    n_points, hidden_size = hidden_states.shape
+    vocab_size = len(chars)
+    if n_points < 2 or hidden_size < 1 or len(text) == 0:
+        return
+
+    projected, mean, components = fit_pca_2d(hidden_states)
+
+    # Layout labels first so the prediction grid covers the full final axes.
+    _, _, _, label_positions = layout_trigram_labels(text, projected)
+    x_min, x_max = projected[:, 0].min(), projected[:, 0].max()
+    y_min, y_max = projected[:, 1].min(), projected[:, 1].max()
+    x_pad = max((x_max - x_min) * 0.12, 1e-3)
+    y_pad = max((y_max - y_min) * 0.12, 1e-3)
+    if label_positions:
+        text_positions = np.array(list(label_positions.values()))
+        x_min = min(x_min, text_positions[:, 0].min())
+        x_max = max(x_max, text_positions[:, 0].max())
+        y_min = min(y_min, text_positions[:, 1].min())
+        y_max = max(y_max, text_positions[:, 1].max())
+        x_pad = max(x_pad, (x_max - x_min) * 0.08)
+        y_pad = max(y_pad, (y_max - y_min) * 0.08)
+    xlim = (x_min - x_pad, x_max + x_pad)
+    ylim = (y_min - y_pad, y_max + y_pad)
+
+    xs = np.linspace(xlim[0], xlim[1], grid_resolution)
+    ys = np.linspace(ylim[0], ylim[1], grid_resolution)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+    grid_hidden = reconstruct_from_pca(grid_coords, mean, components)
+    grid_pred = argmax_next_char(model, grid_hidden).reshape(grid_resolution, grid_resolution)
+
+    pred_cmap = plt.get_cmap("tab10", vocab_size)
+    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.contourf(
+        grid_x, grid_y, grid_pred,
+        levels=np.arange(-0.5, vocab_size, 1),
+        cmap=pred_cmap, alpha=0.35, antialiased=True, zorder=1,
+    )
+
+    add_trigram_annotations(ax, text, projected)
+
+    region_handles = [
+        plt.Rectangle(
+            (0, 0), 1, 1,
+            facecolor=pred_cmap(i), edgecolor="none", alpha=0.35,
+        )
+        for i in range(vocab_size)
+    ]
+    ax.legend(
+        region_handles,
+        [f"next {display_char(c)!r}" for c in chars],
+        title="background region",
+        loc="upper right",
+        framealpha=0.92,
+        fontsize=8,
+    )
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(
+        "PCA: background = argmax next-char (2D-reconstructed h); "
+        "points/lines/labels = prev2+current trigram"
+    )
+    ax.grid(True, linestyle=":", alpha=0.35)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"wrote {save_path}")
 
 
 def plot_mds_context_labels(text, hidden_states, chars, save_path):
@@ -667,6 +793,11 @@ def main() -> None:
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
         save_path=os.path.join(args.out_dir, "hidden_states_pca_context_labels.png"),
+    )
+
+    plot_pca_prediction_regions(
+        model, text, hidden_states, model["chars"],
+        save_path=os.path.join(args.out_dir, "hidden_states_pca_prediction_regions.png"),
     )
 
     plot_mds_context_labels(
