@@ -30,14 +30,17 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
   7) hidden_states_pca_prediction_regions.png
        PCA plane colored by argmax next-char prediction (2D reconstruction).
 
-  8) hidden_states_mds_context_labels.png
+  8) hidden_states_pca_next_char_prob_panels.png
+       One panel per vocab char: P(next = char) over the PCA plane (softmax).
+
+  9) hidden_states_mds_context_labels.png
        2D MDS from the same euclidean distances as the clustermap dendrogram.
 
-  9) hidden_states_clustermap.png
+  10) hidden_states_clustermap.png
        Heatmap of timesteps × hidden units with row/column dendrograms
        (average linkage). Row labels: two preceding chars + current char.
 
-  10) weights.png
+  11) weights.png
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
@@ -337,10 +340,45 @@ def reconstruct_from_pca(coords, mean, components):
 
 def argmax_next_char(model, hidden_states):
     """Most likely next character index for each row of hidden_states."""
+    return np.argmax(next_char_probabilities(model, hidden_states), axis=1)
+
+
+def next_char_probabilities(model, hidden_states):
+    """Softmax next-char distribution for each row of hidden_states."""
     weights = model["weights_hidden_to_output"]
     bias = model["bias_output"].ravel()
     logits = hidden_states @ weights.T + bias
-    return np.argmax(logits, axis=1)
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(logits)
+    return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
+    """PCA mesh and 2D-reconstructed hidden states on a grid covering data + labels."""
+    projected, mean, components = fit_pca_2d(hidden_states)
+    x_min, x_max = projected[:, 0].min(), projected[:, 0].max()
+    y_min, y_max = projected[:, 1].min(), projected[:, 1].max()
+    x_pad = max((x_max - x_min) * 0.12, 1e-3)
+    y_pad = max((y_max - y_min) * 0.12, 1e-3)
+    if text:
+        _, _, _, label_positions = layout_trigram_labels(text, projected)
+        if label_positions:
+            text_positions = np.array(list(label_positions.values()))
+            x_min = min(x_min, text_positions[:, 0].min())
+            x_max = max(x_max, text_positions[:, 0].max())
+            y_min = min(y_min, text_positions[:, 1].min())
+            y_max = max(y_max, text_positions[:, 1].max())
+            x_pad = max(x_pad, (x_max - x_min) * 0.08)
+            y_pad = max(y_pad, (y_max - y_min) * 0.08)
+    xlim = (x_min - x_pad, x_max + x_pad)
+    ylim = (y_min - y_pad, y_max + y_pad)
+
+    xs = np.linspace(xlim[0], xlim[1], grid_resolution)
+    ys = np.linspace(ylim[0], ylim[1], grid_resolution)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+    grid_hidden = reconstruct_from_pca(grid_coords, mean, components)
+    return grid_x, grid_y, grid_hidden, projected, xlim, ylim
 
 
 def mds_2d(points):
@@ -573,30 +611,9 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
     if n_points < 2 or hidden_size < 1 or len(text) == 0:
         return
 
-    projected, mean, components = fit_pca_2d(hidden_states)
-
-    # Layout labels first so the prediction grid covers the full final axes.
-    _, _, _, label_positions = layout_trigram_labels(text, projected)
-    x_min, x_max = projected[:, 0].min(), projected[:, 0].max()
-    y_min, y_max = projected[:, 1].min(), projected[:, 1].max()
-    x_pad = max((x_max - x_min) * 0.12, 1e-3)
-    y_pad = max((y_max - y_min) * 0.12, 1e-3)
-    if label_positions:
-        text_positions = np.array(list(label_positions.values()))
-        x_min = min(x_min, text_positions[:, 0].min())
-        x_max = max(x_max, text_positions[:, 0].max())
-        y_min = min(y_min, text_positions[:, 1].min())
-        y_max = max(y_max, text_positions[:, 1].max())
-        x_pad = max(x_pad, (x_max - x_min) * 0.08)
-        y_pad = max(y_pad, (y_max - y_min) * 0.08)
-    xlim = (x_min - x_pad, x_max + x_pad)
-    ylim = (y_min - y_pad, y_max + y_pad)
-
-    xs = np.linspace(xlim[0], xlim[1], grid_resolution)
-    ys = np.linspace(ylim[0], ylim[1], grid_resolution)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    grid_hidden = reconstruct_from_pca(grid_coords, mean, components)
+    grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
+        text, hidden_states, grid_resolution,
+    )
     grid_pred = argmax_next_char(model, grid_hidden).reshape(grid_resolution, grid_resolution)
 
     pred_cmap = plt.get_cmap("tab10", vocab_size)
@@ -635,6 +652,66 @@ def plot_pca_prediction_regions(model, text, hidden_states, chars, save_path, gr
     )
     ax.grid(True, linestyle=":", alpha=0.35)
     fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
+def plot_pca_next_char_probability_panels(
+    model, text, hidden_states, chars, save_path, grid_resolution=120,
+):
+    """One panel per vocab char: P(next = char) over the PCA plane (from softmax)."""
+    n_points, hidden_size = hidden_states.shape
+    vocab_size = len(chars)
+    if n_points < 2 or hidden_size < 1:
+        return
+
+    grid_x, grid_y, grid_hidden, _, xlim, ylim = build_pca_plane_grid(
+        text, hidden_states, grid_resolution,
+    )
+    probs = next_char_probabilities(model, grid_hidden)
+
+    ncols = min(3, vocab_size)
+    nrows = (vocab_size + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(4.4 * ncols, 3.9 * nrows),
+        sharex=True, sharey=True,
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes).ravel()
+    last_im = None
+
+    for char_index, (ax, char) in enumerate(zip(axes, chars)):
+        field = probs[:, char_index].reshape(grid_resolution, grid_resolution)
+        last_im = ax.contourf(
+            grid_x, grid_y, field,
+            levels=np.linspace(0, 1, 21),
+            cmap="viridis", vmin=0, vmax=1, antialiased=True,
+        )
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title(f"P(next = {display_char(char)!r})")
+        ax.set_aspect("equal", adjustable="box")
+
+    for ax in axes[vocab_size:]:
+        ax.axis("off")
+
+    axes[0].set_ylabel("PC2")
+    axes[(nrows - 1) * ncols].set_xlabel("PC1")
+    if nrows > 1:
+        for row in range(1, nrows):
+            axes[row * ncols].set_ylabel("PC2")
+        for col in range(1, ncols):
+            bottom = min((nrows - 1) * ncols + col, vocab_size - 1)
+            if bottom < vocab_size:
+                axes[bottom].set_xlabel("PC1")
+
+    fig.colorbar(last_im, ax=axes[:vocab_size], label="probability", shrink=0.92)
+    fig.suptitle(
+        "P(next char | 2D-reconstructed h) over PCA plane (one panel per output logit)",
+        fontsize=11, y=1.02,
+    )
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -798,6 +875,11 @@ def main() -> None:
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
         save_path=os.path.join(args.out_dir, "hidden_states_pca_prediction_regions.png"),
+    )
+
+    plot_pca_next_char_probability_panels(
+        model, text, hidden_states, model["chars"],
+        save_path=os.path.join(args.out_dir, "hidden_states_pca_next_char_prob_panels.png"),
     )
 
     plot_mds_context_labels(
