@@ -41,7 +41,11 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        Timestep × timestep Pearson correlation of hidden states, hierarchically
        clustered; row/column labels = prefix since last space; tick colors = min DFA state.
 
-  10) weights.png
+  11) hidden_states_dfa_distance_comparison.png
+       Pairwise Euclidean distances between hidden states; bars = within vs between
+       minimized DFA state (all timestep pairs in the test window).
+
+  12) weights.png
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
@@ -425,6 +429,7 @@ def plot_hidden_states_clustermap(
         figsize=(max(9, n_cols * 0.55), max(6, n_rows * 0.25)),
         dendrogram_ratio=(0.12, 0.1),
         cbar=False,
+        cbar_pos=None,
         xticklabels=True,
         yticklabels=True,
     )
@@ -521,6 +526,134 @@ def plot_hidden_states_correlation_clustermap(
     )
     grid.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(grid.fig)
+    print(f"wrote {save_path}")
+
+
+def pairwise_hidden_state_distance_groups(
+    text: str,
+    hidden_states: np.ndarray,
+    state_ids: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """L2 distance for each timestep pair (i < j): within DFA, between DFA, same input char."""
+    n = hidden_states.shape[0]
+    within: list[float] = []
+    between: list[float] = []
+    same_input: list[float] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = float(np.linalg.norm(hidden_states[i] - hidden_states[j]))
+            if state_ids[i] == state_ids[j]:
+                within.append(dist)
+            else:
+                between.append(dist)
+            if text[i] == text[j]:
+                same_input.append(dist)
+    return np.asarray(within), np.asarray(between), np.asarray(same_input)
+
+
+def plot_dfa_state_distance_comparison(
+    text: str,
+    hidden_states: np.ndarray,
+    automaton: MinimizedVocabAutomaton,
+    save_path: str,
+    *,
+    spaced: bool = False,
+) -> None:
+    """Subsampled pairwise distances + mean (diamond) ± std; y-axis clipped at 0."""
+    n = hidden_states.shape[0]
+    if n < 2:
+        return
+
+    state_ids = [
+        dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+    ]
+    within, between, same_input = pairwise_hidden_state_distance_groups(
+        text, hidden_states, state_ids
+    )
+    if len(within) == 0 or len(between) == 0:
+        print("DFA distance comparison: need both within- and between-state pairs")
+        return
+
+    palette = {
+        "Within DFA state": "#4c72b0",
+        "Same input char": "#55a868",
+        "Between DFA states": "#dd8452",
+    }
+    by_label = {
+        "Within DFA state": within,
+        "Same input char": same_input,
+        "Between DFA states": between,
+    }
+    order = [
+        label for label in ("Within DFA state", "Same input char", "Between DFA states")
+        if len(by_label[label]) > 0
+    ]
+    specs = [(label, by_label[label]) for label in order]
+    stats = {
+        label: (float(np.mean(vals)), float(np.std(vals)), len(vals))
+        for label, vals in specs
+    }
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5), constrained_layout=True)
+    x = np.arange(len(order))
+    rng = np.random.default_rng(0)
+    max_points = 200
+    for i, label in enumerate(order):
+        vals = np.asarray(by_label[label], dtype=float)
+        if len(vals) > max_points:
+            idx = rng.choice(len(vals), size=max_points, replace=False)
+            vals = vals[idx]
+        jitter = rng.uniform(-0.18, 0.18, size=len(vals))
+        color = palette[label]
+        ax.scatter(
+            x[i] + jitter,
+            vals,
+            c=color,
+            alpha=0.35,
+            s=14,
+            linewidths=0,
+            zorder=1,
+        )
+
+        mean, std, _ = stats[label]
+        err_lo = min(mean, std)
+        ax.errorbar(
+            x[i],
+            mean,
+            yerr=np.array([[err_lo], [std]]),
+            fmt="D",
+            color=color,
+            ecolor=color,
+            elinewidth=2.0,
+            capsize=10,
+            capthick=2.0,
+            markersize=9,
+            markerfacecolor="white",
+            markeredgecolor="0.15",
+            markeredgewidth=1.5,
+            zorder=4,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(order)
+    ax.set_xlabel("")
+    ax.set_ylabel("Euclidean distance ||h_i − h_j||")
+    n_pairs = n * (n - 1) // 2
+    ax.set_title(f"Pairwise hidden-state distance ({n_pairs} pairs, n={n} timesteps)")
+    ax.grid(True, axis="y", linestyle=":", alpha=0.35)
+    ax.set_xlim(-0.6, len(order) - 0.4)
+    ax.set_ylim(bottom=0)
+    within_mean = stats.get("Within DFA state", (float("nan"),))[0]
+    between_mean = stats.get("Between DFA states", (float("nan"),))[0]
+    ratio = within_mean / between_mean if between_mean > 0 else float("inf")
+    parts = [
+        f"{label}: n={n_} mean={m:.4f} std={s:.4f}"
+        for label, (m, s, n_) in stats.items()
+    ]
+    print("pairwise L2: " + " | ".join(parts) + f" | ratio within/between={ratio:.3f}")
+
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
     print(f"wrote {save_path}")
 
 
@@ -697,11 +830,15 @@ def _draw_annotation_groups(
     label_positions: dict,
     point_colors: list,
     label_text: dict,
+    *,
+    point_size: float = 40,
+    label_fontsize: float = CONTEXT_LABEL_FONTSIZE,
+    leader_linewidth: float = 1.4,
 ) -> list[tuple[float, float]]:
     """Scatter + leader lines + one label per group (shared by trigram / DFA modes)."""
     ax.scatter(
         projected[:, 0], projected[:, 1],
-        s=40, c=point_colors, edgecolors="black", linewidths=0.5,
+        s=point_size, c=point_colors, edgecolors="black", linewidths=0.5,
         zorder=6,
     )
 
@@ -711,11 +848,11 @@ def _draw_annotation_groups(
         for point in projected[indices]:
             ax.plot(
                 [text_pos[0], point[0]], [text_pos[1], point[1]],
-                color=color, linewidth=1.4, solid_capstyle="round", zorder=5,
+                color=color, linewidth=leader_linewidth, solid_capstyle="round", zorder=5,
             )
         ax.text(
             text_pos[0], text_pos[1], label_text[key],
-            fontsize=CONTEXT_LABEL_FONTSIZE, color="#1a1a1a",
+            fontsize=label_fontsize, color="#1a1a1a",
             ha="center", va="center",
             bbox=_context_annotation_bbox(color),
             path_effects=_context_annotation_effects(),
@@ -757,6 +894,9 @@ def add_dfa_state_annotations(
     spaced: bool,
     state_colors: dict[int, tuple] | None = None,
     show_legend: bool = False,
+    point_size: float = 40,
+    label_fontsize: float = CONTEXT_LABEL_FONTSIZE,
+    leader_linewidth: float = 1.4,
 ):
     """Point color = min DFA state; annotation text = prefix since last space."""
     n = len(text)
@@ -777,7 +917,10 @@ def add_dfa_state_annotations(
     label_text = {p: ("␣" if p == " " else p) for p in by_prefix}
 
     text_positions = _draw_annotation_groups(
-        ax, projected, by_prefix, label_positions, point_colors, label_text
+        ax, projected, by_prefix, label_positions, point_colors, label_text,
+        point_size=point_size,
+        label_fontsize=label_fontsize,
+        leader_linewidth=leader_linewidth,
     )
     if show_legend:
         _add_dfa_state_color_legend(ax, automaton, state_colors)
@@ -1187,11 +1330,17 @@ def plot_pca_dfa_analysis(
     state_colors = _state_id_colors(state_ids)
 
     fig, axes = plt.subplots(1, 2, figsize=(28, 11), constrained_layout=True)
-    ax_pca, ax_dfa = axes
+    ax_dfa, ax_pca = axes[0], axes[1]
+
+    draw_minimized_dfa_on_axes(ax_dfa, automaton, words, state_colors=state_colors)
+    ax_dfa.set_title("Minimal DFA", fontsize=12, pad=12)
 
     text_positions = add_dfa_state_annotations(
         ax_pca, text, projected, automaton,
         spaced=spaced, state_colors=state_colors,
+        point_size=160,
+        label_fontsize=18,
+        leader_linewidth=2.8,
     )
     _expand_limits_for_annotations(
         ax_pca, projected, text_positions,
@@ -1205,14 +1354,12 @@ def plot_pca_dfa_analysis(
     ctx = "prefix since last space" if spaced else "stream prefix"
     ax_pca.set_title(f"2D PCA (min DFA state · {ctx})")
     ax_pca.grid(True, linestyle=":", alpha=0.35)
+    ax_pca.spines["top"].set_visible(False)
+    ax_pca.spines["right"].set_visible(False)
+    ax_pca.tick_params(top=False, right=False)
 
-    draw_minimized_dfa_on_axes(ax_dfa, automaton, words, state_colors=state_colors)
-
-    fig.suptitle(
-        f"Hidden states vs vocabulary DFA · {original_vocabulary_title(chars, text)}",
-        fontsize=12, y=1.01,
-    )
-    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    fig.suptitle(", ".join(words), fontsize=12, y=1.01)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -1315,7 +1462,15 @@ def plot_pca_prediction_regions(
 
 
 def plot_pca_next_char_probability_panels(
-    model, text, hidden_states, chars, save_path, grid_resolution=120,
+    model,
+    text,
+    hidden_states,
+    chars,
+    save_path,
+    grid_resolution=120,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
 ):
     """One panel per vocab char: P(next = char) over the PCA plane (from softmax)."""
     n_points, hidden_size = hidden_states.shape
@@ -1323,7 +1478,7 @@ def plot_pca_next_char_probability_panels(
     if n_points < 2 or hidden_size < 1:
         return
 
-    grid_x, grid_y, grid_hidden, _, xlim, ylim = build_pca_plane_grid(
+    grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
         text, hidden_states, grid_resolution,
     )
     probs = next_char_probabilities(model, grid_hidden)
@@ -1350,6 +1505,9 @@ def plot_pca_next_char_probability_panels(
         ax.set_ylim(ylim)
         ax.set_title(f"P(next = {display_char(char)!r})")
         ax.set_aspect("equal", adjustable="box")
+        add_pca_point_annotations(
+            ax, text, projected, spaced=spaced, automaton=automaton
+        )
 
     for ax in axes[vocab_size:]:
         ax.axis("off")
@@ -1690,6 +1848,8 @@ def main() -> None:
     plot_pca_next_char_probability_panels(
         model, text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_pca_next_char_prob_panels.png"),
+        spaced=spaced,
+        automaton=automaton,
     )
 
     plot_hidden_states_clustermap(
@@ -1704,6 +1864,13 @@ def main() -> None:
         spaced=spaced,
         automaton=automaton,
     )
+
+    if automaton is not None:
+        plot_dfa_state_distance_comparison(
+            text, hidden_states, automaton,
+            save_path=os.path.join(out_dir, "hidden_states_dfa_distance_comparison.png"),
+            spaced=spaced,
+        )
 
     if model["hidden_size"] == 2:
         plot_state_trajectory(
