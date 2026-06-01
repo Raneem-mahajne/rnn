@@ -37,6 +37,10 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        Heatmap of timesteps × hidden units with row/column dendrograms
        (average linkage). Row labels: two preceding chars + current char.
 
+  10) hidden_states_correlation_clustermap.png
+       Timestep × timestep Pearson correlation of hidden states, hierarchically
+       clustered; row/column labels = prefix since last space; tick colors = min DFA state.
+
   10) weights.png
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
@@ -431,6 +435,89 @@ def plot_hidden_states_clustermap(
     grid.fig.suptitle(
         f"Hidden states clustered (timesteps × units) · {original_vocabulary_title(chars, text)}",
         y=1.02, fontsize=11,
+    )
+    grid.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(grid.fig)
+    print(f"wrote {save_path}")
+
+
+def prefix_tick_label(text: str, index: int, *, spaced: bool) -> str:
+    """Axis tick text: in-word prefix since last space (␣ on spaces)."""
+    label = prefix_annotation_label(text, index, spaced=spaced)
+    return "␣" if label == " " else label
+
+
+def plot_hidden_states_correlation_clustermap(
+    text: str,
+    hidden_states: np.ndarray,
+    chars,
+    save_path: str,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+):
+    """One clustered matrix: Pearson r between hidden states at each timestep."""
+    n = hidden_states.shape[0]
+    if n < 2:
+        return
+
+    labels = [prefix_tick_label(text, t, spaced=spaced) for t in range(n)]
+    corr = np.corrcoef(hidden_states)
+    np.fill_diagonal(corr, 1.0)
+    corr = np.nan_to_num(corr, nan=0.0)
+
+    data = pd.DataFrame(corr, index=labels, columns=labels)
+
+    state_ids = None
+    state_colors = None
+    if automaton is not None:
+        state_ids = [
+            dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+        ]
+        state_colors = _state_id_colors(state_ids)
+
+    panel = max(10.0, n * 0.2)
+    grid = sns.clustermap(
+        data,
+        method="average",
+        metric="euclidean",
+        cmap="RdBu_r",
+        vmin=-1,
+        vmax=1,
+        center=0,
+        figsize=(panel, panel),
+        dendrogram_ratio=(0.12, 0.12),
+        cbar=False,
+        cbar_pos=None,
+        xticklabels=True,
+        yticklabels=True,
+    )
+
+    if state_ids is not None and state_colors is not None:
+        row_order = grid.dendrogram_row.reordered_ind
+        col_order = grid.dendrogram_col.reordered_ind
+        for tick, idx in zip(grid.ax_heatmap.get_yticklabels(), row_order):
+            tick.set_color(state_colors[state_ids[idx]])
+        for tick, idx in zip(grid.ax_heatmap.get_xticklabels(), col_order):
+            tick.set_color(state_colors[state_ids[idx]])
+
+    axis_label = (
+        "prefix since last space"
+        if spaced
+        else "stream prefix"
+    )
+    grid.ax_heatmap.set_xlabel(axis_label)
+    grid.ax_heatmap.set_ylabel(axis_label)
+    grid.ax_heatmap.tick_params(axis="both", labelsize=7)
+    plt.setp(grid.ax_heatmap.get_xticklabels(), rotation=90, ha="center")
+
+    title = "Hidden-state correlation"
+    if automaton is not None:
+        title += " · tick color = min DFA state"
+    grid.fig.suptitle(
+        f"{title} · {original_vocabulary_title(chars, text)}",
+        y=1.02,
+        fontsize=11,
     )
     grid.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(grid.fig)
@@ -1495,6 +1582,13 @@ def main() -> None:
         text, hidden_states, model["chars"],
         save_path=os.path.join(out_dir, "hidden_states_clustermap.png"),
         exp_name=args.exp,
+    )
+
+    plot_hidden_states_correlation_clustermap(
+        text, hidden_states, model["chars"],
+        save_path=os.path.join(out_dir, "hidden_states_correlation_clustermap.png"),
+        spaced=spaced,
+        automaton=automaton,
     )
 
     if model["hidden_size"] == 2:
