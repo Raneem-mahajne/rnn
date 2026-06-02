@@ -104,6 +104,27 @@ def load_model(path: str = "model.npz"):
         model["loss_iterations"] = data["loss_iterations"]
         model["loss_smooth"] = data["loss_smooth"]
         model["loss_window"] = data["loss_window"]
+    if "metric_iterations" in data.files:
+        model["metric_iterations"] = data["metric_iterations"]
+        model["metric_valid_vocab_letter_frac"] = data["metric_valid_vocab_letter_frac"]
+    if "vocab_words" in data.files:
+        model["vocab_words"] = [str(w) for w in data["vocab_words"]]
+    if "sample_before" in data.files:
+        model["sample_before"] = str(data["sample_before"])
+    if "sample_after" in data.files:
+        model["sample_after"] = str(data["sample_after"])
+    if "demo_target" in data.files:
+        model["demo_target"] = str(data["demo_target"])
+    if "demo_prompt" in data.files:
+        model["demo_prompt"] = str(data["demo_prompt"])
+    if "demo_before" in data.files:
+        model["demo_before"] = str(data["demo_before"])
+    if "demo_after" in data.files:
+        model["demo_after"] = str(data["demo_after"])
+    if "demo_rng_seed" in data.files:
+        model["demo_rng_seed"] = int(data["demo_rng_seed"])
+    if "demo_seed_char" in data.files:
+        model["demo_seed_char"] = str(data["demo_seed_char"])
     return model
 
 
@@ -667,6 +688,18 @@ def fit_pca_2d(points):
     return coords, mean, components
 
 
+def fit_pca_2d_with_evr(points):
+    """PCA fit + explained variance ratio for PC1/PC2."""
+    mean = np.mean(points, axis=0)
+    centered = points - mean
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    components = vh[:2]
+    coords = centered @ components.T
+    denom = float(np.sum(s * s)) if len(s) else 1.0
+    evr = (s[:2] * s[:2]) / denom if denom > 0 else np.array([0.0, 0.0])
+    return coords, mean, components, evr
+
+
 def pca_2d(points):
     """Project points to two dimensions with PCA using NumPy's SVD."""
     return fit_pca_2d(points)[0]
@@ -739,9 +772,116 @@ def plot_learning_curve(model, save_path):
     ax.plot(iters, window, color="steelblue", linewidth=1.0)
     ax.set_xlabel("iteration")
     ax.set_ylabel("cross-entropy (sum over BPTT window)")
-    ax.set_title("Training loss")
+    ax.set_title("Training loss (and word-validity proxy)")
     ax.grid(True, linestyle=":", alpha=0.4)
+
+    # Optional metric: fraction of letters (excluding spaces) that fall in in-vocab tokens
+    # in a short deterministic rollout from the current model state.
+    if "metric_iterations" in model and "metric_valid_vocab_letter_frac" in model:
+        ax2 = ax.twinx()
+        ax2.plot(
+            model["metric_iterations"],
+            100.0 * (1.0 - model["metric_valid_vocab_letter_frac"]),
+            color="darkorange",
+            linewidth=1.2,
+            alpha=0.9,
+        )
+        ax2.set_ylabel("% letters out of vocab (rollout)")
+        ax2.set_ylim(0, 100)
     fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
+def _token_letter_valid_mask(text: str, vocab: set[str]) -> list[bool]:
+    """Per-character mask: True if char is in a token that is exactly in vocab."""
+    mask = [False] * len(text)
+    if not vocab or not text:
+        return mask
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == " ":
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] != " ":
+            j += 1
+        token = text[i:j]
+        ok = token in vocab
+        for k in range(i, j):
+            mask[k] = ok
+        i = j
+    return mask
+
+
+def plot_sample_before_after(model, save_path: str) -> None:
+    """Show deterministic samples before/after training, colored by vocab validity."""
+    if "sample_before" not in model or "sample_after" not in model:
+        print(f"skip {save_path}: re-run min-char-rnn.py to record samples")
+        return
+
+    before = str(model["sample_before"])
+    after = str(model["sample_after"])
+    vocab = set(map(str, model.get("vocab_words", [])))
+
+    demo_prompt = str(model.get("demo_prompt", ""))
+    demo_target = str(model.get("demo_target", ""))
+    demo_before = str(model.get("demo_before", ""))
+    demo_after = str(model.get("demo_after", ""))
+
+    def draw_line(ax, title: str, text: str, *, colors: list[str] | None = None):
+        ax.set_axis_off()
+        x0, y0 = 0.01, 0.55
+        dx = 0.0125
+        x = x0
+        for i, ch in enumerate(text):
+            color = colors[i] if (colors is not None and i < len(colors)) else "0.15"
+            ax.text(
+                x, y0, ch,
+                transform=ax.transAxes,
+                fontfamily="monospace",
+                fontsize=14,
+                color=color,
+                va="center",
+            )
+            x += dx
+        ax.text(0.01, 0.88, title, transform=ax.transAxes, fontsize=12, color="0.15")
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 6.0), constrained_layout=True)
+
+    training_demo = (demo_prompt + demo_target).strip()
+    draw_line(
+        axes[0],
+        "Demo snippet from training sequence",
+        training_demo if training_demo else (demo_target or before),
+    )
+    ax_before, ax_after = axes[1], axes[2]
+
+    def vocab_colors(text: str) -> list[str]:
+        mask = _token_letter_valid_mask(text, vocab)
+        out = []
+        for ch, ok in zip(text, mask):
+            if ch == " ":
+                out.append("0.6")
+            else:
+                out.append("#2ca02c" if ok else "#d62728")
+        return out
+
+    draw_line(
+        ax_before,
+        "Generated before learning (stochastic) — green=in vocab, red=not in vocab",
+        demo_before or before,
+        colors=vocab_colors(demo_before or before),
+    )
+    draw_line(
+        ax_after,
+        "Generated after learning (stochastic) — green=in vocab, red=not in vocab",
+        demo_after or after,
+        colors=vocab_colors(demo_after or after),
+    )
+
+    fig.savefig(save_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -897,6 +1037,7 @@ def add_dfa_state_annotations(
     point_size: float = 40,
     label_fontsize: float = CONTEXT_LABEL_FONTSIZE,
     leader_linewidth: float = 1.4,
+    annot_style: str = "leaders",
 ):
     """Point color = min DFA state; annotation text = prefix since last space."""
     n = len(text)
@@ -916,12 +1057,42 @@ def add_dfa_state_annotations(
     label_positions = _layout_group_label_positions(projected, by_prefix)
     label_text = {p: ("␣" if p == " " else p) for p in by_prefix}
 
-    text_positions = _draw_annotation_groups(
-        ax, projected, by_prefix, label_positions, point_colors, label_text,
-        point_size=point_size,
-        label_fontsize=label_fontsize,
-        leader_linewidth=leader_linewidth,
-    )
+    annot_style = (annot_style or "leaders").lower()
+    if annot_style == "none":
+        ax.scatter(
+            projected[:, 0],
+            projected[:, 1],
+            c=point_colors,
+            s=point_size,
+            edgecolor="white",
+            linewidth=0.8,
+            alpha=0.92,
+            zorder=4,
+        )
+        text_positions = []
+    elif annot_style == "annots_only":
+        # Put the prefix labels directly at each point (no box, no leader lines).
+        fs = max(8, int(label_fontsize * 0.65))
+        for i, prefix in enumerate(prefixes):
+            label = "␣" if prefix == " " else prefix
+            ax.text(
+                projected[i, 0],
+                projected[i, 1],
+                label,
+                fontsize=fs,
+                color=point_colors[i],
+                ha="center",
+                va="center",
+                zorder=10,
+            )
+        text_positions = projected.tolist()
+    else:
+        text_positions = _draw_annotation_groups(
+            ax, projected, by_prefix, label_positions, point_colors, label_text,
+            point_size=point_size,
+            label_fontsize=label_fontsize,
+            leader_linewidth=leader_linewidth,
+        )
     if show_legend:
         _add_dfa_state_color_legend(ax, automaton, state_colors)
     return text_positions
@@ -947,10 +1118,17 @@ def add_pca_point_annotations(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
     show_dfa_legend: bool = False,
+    annot_style: str = "leaders",
 ):
     if automaton is not None:
         return add_dfa_state_annotations(
-            ax, text, projected, automaton, spaced=spaced, show_legend=show_dfa_legend
+            ax,
+            text,
+            projected,
+            automaton,
+            spaced=spaced,
+            show_legend=show_dfa_legend,
+            annot_style=annot_style,
         )
     return add_trigram_annotations(ax, text, projected, spaced=spaced)
 
@@ -1006,6 +1184,123 @@ def plot_2d_hidden_state_labels(
     if fig_suptitle:
         fig.suptitle(fig_suptitle, fontsize=11, y=1.02)
     fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
+def _plot_2d_hidden_state_labels_on_ax(
+    ax,
+    text: str,
+    projected: np.ndarray,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+    annot_style: str = "leaders",
+) -> None:
+    if len(text) == 0:
+        return
+    text_positions = add_pca_point_annotations(
+        ax,
+        text,
+        projected,
+        spaced=spaced,
+        automaton=automaton,
+        annot_style=annot_style,
+    )
+    _expand_limits_for_annotations(
+        ax, projected, text_positions,
+        (projected[:, 0].min(), projected[:, 0].max()),
+        (projected[:, 1].min(), projected[:, 1].max()),
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", alpha=0.35)
+
+
+def plot_dimred_context_panels(
+    text: str,
+    hidden_states: np.ndarray,
+    chars,
+    save_path: str,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+    annot_style: str = "leaders",
+) -> None:
+    """Compare multiple 2D embeddings with the same annotation/coloring scheme."""
+    _ = chars
+    n = len(text)
+    if n < 1:
+        return
+
+    # Lazy imports: these are optional in some environments.
+    from sklearn.manifold import TSNE, Isomap  # type: ignore
+    from umap import UMAP  # type: ignore
+
+    # --- Embeddings -----------------------------------------------------------
+    pca_xy, _, _, evr = fit_pca_2d_with_evr(hidden_states)
+    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+
+    umap_xy = UMAP(
+        n_components=2,
+        n_neighbors=min(15, max(2, n - 1)),
+        min_dist=0.1,
+        random_state=0,
+    ).fit_transform(hidden_states)
+
+    perplexity = min(30, max(5, (n - 1) // 3))
+    tsne_xy = TSNE(
+        n_components=2,
+        init="pca",
+        learning_rate="auto",
+        perplexity=perplexity,
+        random_state=0,
+    ).fit_transform(hidden_states)
+
+    isomap_xy = Isomap(
+        n_components=2,
+        n_neighbors=min(10, max(2, n - 1)),
+    ).fit_transform(hidden_states)
+
+    panels = [
+        ("PCA", pca_xy, f"PC1 ({pc1:.1f}%)", f"PC2 ({pc2:.1f}%)",
+         f"PCA\nvariance explained: PC1 {pc1:.1f}%, PC2 {pc2:.1f}%"),
+        ("UMAP", umap_xy, "UMAP-1", "UMAP-2", "UMAP"),
+        ("t-SNE", tsne_xy, "t-SNE-1", "t-SNE-2", f"t-SNE (perplexity={perplexity})"),
+        ("Isomap", isomap_xy, "Isomap-1", "Isomap-2", "Isomap"),
+    ]
+
+    ctx = "prefix since last space" if spaced else "stream prefix"
+    if automaton is not None:
+        scheme = f"min DFA state · {ctx}"
+    else:
+        scheme = "prefix after space" if spaced else "prev2+current (3-char)"
+
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14), constrained_layout=True)
+    axes = axes.ravel()
+    for ax, (_, xy, xlabel, ylabel, title) in zip(axes, panels):
+        _plot_2d_hidden_state_labels_on_ax(
+            ax,
+            text,
+            xy,
+            title=f"{title}\n({scheme})",
+            xlabel=xlabel,
+            ylabel=ylabel,
+            spaced=spaced,
+            automaton=automaton,
+            annot_style=annot_style,
+        )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(top=False, right=False)
+
+    fig.suptitle(original_vocabulary_title(chars, text), fontsize=12, y=1.01)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -1209,29 +1504,15 @@ def plot_pca_context_labels(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
 ):
-    """2D PCA of hidden states with context labels."""
-    if len(text) < 1:
-        return
-    if automaton is not None:
-        title = "2D PCA (min DFA state · prefix since last space)" if spaced else (
-            "2D PCA (min DFA state)"
-        )
-    else:
-        title = (
-            "2D PCA (prefix after space)"
-            if spaced
-            else "2D PCA (prev2+current, 3-char)"
-        )
-    plot_2d_hidden_state_labels(
-        text, hidden_states, chars,
-        pca_2d(hidden_states),
+    """4-panel dim-reduction comparison with shared annotations/colors."""
+    plot_dimred_context_panels(
+        text,
+        hidden_states,
+        chars,
         save_path,
-        title=title,
-        xlabel="PC1",
-        ylabel="PC2",
-        fig_suptitle=original_vocabulary_title(chars, text),
         spaced=spaced,
         automaton=automaton,
+        annot_style="annots_only",
     )
 
 
@@ -1318,12 +1599,12 @@ def plot_pca_dfa_analysis(
     automaton: MinimizedVocabAutomaton,
     *,
     spaced: bool = False,
+    annot_style: str = "leaders",
 ):
     """Plain PCA (DFA-colored points) beside the min-DFA with matching state colors."""
     if len(text) < 2:
         return
-
-    projected = pca_2d(hidden_states)
+    projected, _, _, evr = fit_pca_2d_with_evr(hidden_states)
     state_ids = [
         dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(len(text))
     ]
@@ -1341,6 +1622,7 @@ def plot_pca_dfa_analysis(
         point_size=160,
         label_fontsize=18,
         leader_linewidth=2.8,
+        annot_style=annot_style,
     )
     _expand_limits_for_annotations(
         ax_pca, projected, text_positions,
@@ -1349,10 +1631,12 @@ def plot_pca_dfa_analysis(
     )
     ax_pca.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax_pca.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    ax_pca.set_xlabel("PC1")
-    ax_pca.set_ylabel("PC2")
+    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+    ax_pca.set_xlabel(f"PC1 ({pc1:.1f}%)")
+    ax_pca.set_ylabel(f"PC2 ({pc2:.1f}%)")
     ctx = "prefix since last space" if spaced else "stream prefix"
-    ax_pca.set_title(f"2D PCA (min DFA state · {ctx})")
+    ax_pca.set_title(f"2D PCA (min DFA state · {ctx})\nvariance explained: PC1 {pc1:.1f}%, PC2 {pc2:.1f}%")
     ax_pca.grid(True, linestyle=":", alpha=0.35)
     ax_pca.spines["top"].set_visible(False)
     ax_pca.spines["right"].set_visible(False)
@@ -1759,6 +2043,12 @@ def main() -> None:
                         help="plot output directory (default: experiments/<exp>/plots or plots)")
     parser.add_argument("--no-cluster-per-char", action="store_true",
                         help="keep per-character heatmap rows in sequence order")
+    parser.add_argument(
+        "--dfa-annot-style",
+        default="annots_only",
+        choices=["leaders", "none", "annots_only"],
+        help="DFA annotation style for hidden_states_pca_dfa_analysis.png",
+    )
     args = parser.parse_args()
 
     model_file, input_file, out_dir = resolve_paths(args)
@@ -1777,6 +2067,10 @@ def main() -> None:
     plot_learning_curve(
         model,
         save_path=os.path.join(out_dir, "learning_curve.png"),
+    )
+    plot_sample_before_after(
+        model,
+        save_path=os.path.join(out_dir, "samples_before_after.png"),
     )
 
     with open(input_file, "r") as f:
@@ -1835,6 +2129,7 @@ def main() -> None:
             save_path=os.path.join(out_dir, "hidden_states_pca_dfa_analysis.png"),
             automaton=automaton,
             spaced=spaced,
+            annot_style=args.dfa_annot_style,
         )
 
     if spaced:

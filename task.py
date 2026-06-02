@@ -39,6 +39,22 @@ REGIMES: dict[str, list[str]] = {
         "met", "pet", "net",
         "ate", "eat", "tea",
     ],
+    # 12 words with shared prefixes and mixed lengths (richer minimal DFA).
+    "twelve_word_overlap": [
+        "an", "ant", "ante", "anti",
+        "ban", "band", "bank",
+        "bar", "bard", "bare", "bark", "barn",
+    ],
+    # 16 words with richer prefix branching and an extra vowel (o).
+    "sixteen_word_overlap": [
+        # a-family
+        "an", "ant", "ante", "anti",
+        # b-family
+        "ban", "band", "bank",
+        "bar", "bard", "bare", "bark", "barn",
+        # o-family (adds vowel + new branching)
+        "on", "one", "only", "onto",
+    ],
 }
 
 

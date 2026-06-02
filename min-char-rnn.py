@@ -40,6 +40,9 @@ print('data has %d characters, %d unique.' % (text_length, vocab_size))
 char_to_index = { char: i for i, char in enumerate(unique_chars) }  # str -> int id
 index_to_char = { i: char for i, char in enumerate(unique_chars) }  # int id -> str
 
+# For word-space corpora, infer the (training) vocabulary as the set of whitespace-delimited tokens.
+vocab_words = set(text.split()) if (" " in text) else set()
+
 # ----- hyperparameters --------------------------------------------------------
 hidden_size = 10           # number of recurrent units in the hidden layer
 sequence_length = 25       # backprop-through-time window: longer = more context but slower / harder to train
@@ -208,6 +211,142 @@ def sample(hidden_state, seed_index, num_chars_to_sample):
   return sampled_indices
 
 
+def argmax_sample(hidden_state, seed_index, num_chars_to_sample):
+  """Deterministic sampling: take argmax at each step (for stable metrics)."""
+  input_one_hot = np.zeros((vocab_size, 1))
+  input_one_hot[seed_index] = 1
+  sampled_indices = []
+  for t in range(num_chars_to_sample):
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
+    probs = np.exp(logits) / np.sum(np.exp(logits))
+    next_char_index = int(np.argmax(probs))
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[next_char_index] = 1
+    sampled_indices.append(next_char_index)
+  return sampled_indices
+
+
+def argmax_sample_with_prompt(prompt_text: str, num_chars_to_sample: int):
+  """
+  Deterministic sampling, conditioned on a prompt sequence.
+  We "teacher-force" the prompt by feeding its characters as the next inputs,
+  then continue with argmax sampling for `num_chars_to_sample` more characters.
+  Returns indices for the continuation only (not including the prompt itself).
+  """
+  if not prompt_text:
+    return []
+  hidden_state = np.zeros((hidden_size, 1))
+  input_one_hot = np.zeros((vocab_size, 1))
+  input_one_hot[char_to_index[prompt_text[0]]] = 1
+
+  # Consume prompt with teacher forcing.
+  for ch_next in prompt_text[1:]:
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    # Advance input to the true next prompt char.
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[char_to_index[ch_next]] = 1
+
+  # Generate continuation.
+  sampled_indices = []
+  for _ in range(num_chars_to_sample):
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
+    probs = np.exp(logits) / np.sum(np.exp(logits))
+    next_char_index = int(np.argmax(probs))
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[next_char_index] = 1
+    sampled_indices.append(next_char_index)
+  return sampled_indices
+
+
+def sample_with_prompt(prompt_text: str, num_chars_to_sample: int, *, rng: np.random.Generator):
+  """
+  Stochastic sampling, conditioned on a prompt sequence (teacher-forced prompt).
+  Returns indices for the continuation only (not including the prompt itself).
+  """
+  if not prompt_text:
+    return []
+  hidden_state = np.zeros((hidden_size, 1))
+  input_one_hot = np.zeros((vocab_size, 1))
+  input_one_hot[char_to_index[prompt_text[0]]] = 1
+
+  # Consume prompt with teacher forcing.
+  for ch_next in prompt_text[1:]:
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[char_to_index[ch_next]] = 1
+
+  sampled_indices = []
+  for _ in range(num_chars_to_sample):
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
+    probs = np.exp(logits) / np.sum(np.exp(logits))
+    next_char_index = int(rng.choice(range(vocab_size), p=probs.ravel()))
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[next_char_index] = 1
+    sampled_indices.append(next_char_index)
+  return sampled_indices
+
+
+def sample_from_seed_char(seed_char: str, num_chars_to_sample: int, *, rng: np.random.Generator):
+  """Stochastic sampling from zero state, seeded by a single character."""
+  if seed_char not in char_to_index:
+    seed_char = text[0]
+  hidden_state = np.zeros((hidden_size, 1))
+  input_one_hot = np.zeros((vocab_size, 1))
+  input_one_hot[char_to_index[seed_char]] = 1
+  sampled_indices = []
+  for _ in range(num_chars_to_sample):
+    hidden_state = np.tanh(
+        np.dot(weights_input_to_hidden,  input_one_hot) +
+        np.dot(weights_hidden_to_hidden, hidden_state) +
+        bias_hidden
+    )
+    logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
+    probs = np.exp(logits) / np.sum(np.exp(logits))
+    next_char_index = int(rng.choice(range(vocab_size), p=probs.ravel()))
+    input_one_hot = np.zeros((vocab_size, 1))
+    input_one_hot[next_char_index] = 1
+    sampled_indices.append(next_char_index)
+  return sampled_indices
+
+
+def valid_vocab_letter_fraction(sampled_text: str, vocab: set[str]) -> float:
+  """Fraction of non-space letters that belong to tokens in `vocab`."""
+  if not vocab:
+    return float("nan")
+  total_letters = 0
+  valid_letters = 0
+  for token in sampled_text.split(" "):
+    if token == "":
+      continue
+    total_letters += len(token)
+    if token in vocab:
+      valid_letters += len(token)
+  return (valid_letters / total_letters) if total_letters > 0 else float("nan")
+
+
 # ----- training loop ----------------------------------------------------------
 iteration, data_pointer = 0, 0
 
@@ -228,6 +367,28 @@ loss_iterations = []
 loss_smooth = []
 loss_window = []
 
+# Extra metric logged during training (not optimized directly): fraction of letters
+# that land inside an in-vocabulary word in a short model rollout.
+metric_iters = []
+metric_valid_letter_frac = []
+
+# Store a short "before vs after" deterministic sample for visualization.
+sample_before_text = None
+sample_after_text = None
+
+# Store a fixed "training snippet vs generated snippet" demo.
+prompt_len = 40
+cont_len = 100
+demo_total = prompt_len + cont_len
+max_start = max(0, len(text) - demo_total - 1)
+demo_start = int(np.random.default_rng().integers(0, max_start + 1)) if max_start > 0 else 0
+demo_prompt = text[demo_start:demo_start + prompt_len]
+demo_target = text[demo_start + prompt_len:demo_start + demo_total]
+demo_before = None
+demo_after = None
+demo_rng_seed = 0
+demo_seed_char = " " if (" " in char_to_index) else text[0]
+
 while iteration < max_iterations:
   # Step the data pointer through the corpus in chunks of `sequence_length`.
   # If we run off the end (or we're on iteration 0), reset the hidden state and wrap to the start.
@@ -246,6 +407,23 @@ while iteration < max_iterations:
     sampled_indices = sample(previous_hidden_state, input_indices[0], 50)
     sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
     print('----\n %s \n----' % (sampled_text,))
+
+    # Deterministic rollout for a stable "word validity" metric.
+    det_indices = argmax_sample(previous_hidden_state, input_indices[0], 200)
+    det_text = ''.join(index_to_char[i] for i in det_indices)
+    metric_iters.append(iteration)
+    metric_valid_letter_frac.append(valid_vocab_letter_fraction(det_text, vocab_words))
+
+    if iteration == 0:
+      sample_before_text = det_text[:160]
+      # Demo: condition on a real training prompt, then generate a continuation.
+      demo_rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
+      demo_idx = sample_from_seed_char(
+          demo_seed_char,
+          cont_len,
+          rng=np.random.default_rng(demo_rng_seed),
+      )
+      demo_before = ''.join(index_to_char[i] for i in demo_idx)
 
   # Forward + backward over the window. previous_hidden_state is updated to the last
   # hidden state of *this* window, so the next iteration continues the recurrence smoothly.
@@ -282,6 +460,17 @@ sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
 print('----\n %s \n----' % (sampled_text,))
 print('iter %d, loss: %f (done)' % (iteration, smooth_loss))
 
+det_indices = argmax_sample(previous_hidden_state, char_to_index[text[0]], 200)
+det_text = ''.join(index_to_char[i] for i in det_indices)
+sample_after_text = det_text[:160]
+
+demo_idx = sample_from_seed_char(
+    demo_seed_char,
+    cont_len,
+    rng=np.random.default_rng(demo_rng_seed),
+)
+demo_after = ''.join(index_to_char[i] for i in demo_idx)
+
 # Save trained parameters and vocab so we can inspect/visualize the model later.
 model_out = args.model
 model_out_parent = os.path.dirname(model_out)
@@ -300,5 +489,16 @@ np.savez(
     loss_iterations=np.array(loss_iterations, dtype=np.int32),
     loss_smooth=np.array(loss_smooth, dtype=np.float64),
     loss_window=np.array(loss_window, dtype=np.float64),
+    metric_iterations=np.array(metric_iters, dtype=np.int32),
+    metric_valid_vocab_letter_frac=np.array(metric_valid_letter_frac, dtype=np.float64),
+    vocab_words=np.array(sorted(vocab_words)),
+    sample_before=np.array(sample_before_text if sample_before_text is not None else ""),
+    sample_after=np.array(sample_after_text if sample_after_text is not None else ""),
+    demo_prompt=np.array(demo_prompt if demo_prompt is not None else ""),
+    demo_target=np.array(demo_target if demo_target is not None else ""),
+    demo_before=np.array(demo_before if demo_before is not None else ""),
+    demo_after=np.array(demo_after if demo_after is not None else ""),
+    demo_rng_seed=np.array(demo_rng_seed, dtype=np.int64),
+    demo_seed_char=np.array(demo_seed_char),
 )
 print(f'saved trained model to {model_out}')

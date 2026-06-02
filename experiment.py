@@ -13,6 +13,8 @@ _BASE_CONFIG: dict[str, dict[str, int]] = {
     "shared_letters": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
     "disjoint_letters": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
     "ten_word_overlap": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
+    "twelve_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
+    "sixteen_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
 }
 
 
