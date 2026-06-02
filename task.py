@@ -32,20 +32,28 @@ REGIMES: dict[str, list[str]] = {
         "ate", "eat", "tea",
     ],
     # 12 words with shared prefixes and mixed lengths (richer minimal DFA).
+    # Designed to have branching after the *first* character too (a→{n,t,x}, b→{a,e}).
     "twelve_word_overlap": [
+        # a-family (splits after 'a')
         "an", "ant", "ante", "anti",
+        "at",
+        "ax",
+        # b-family (splits after 'b')
         "ban", "band", "bank",
-        "bar", "bard", "bare", "bark", "barn",
+        "be", "bet", "bent",
     ],
     # 16 words with richer prefix branching and an extra vowel (o).
+    # Also designed to have branching after the *first* character in each family.
     "sixteen_word_overlap": [
         # a-family
         "an", "ant", "ante", "anti",
+        "at",
         # b-family
         "ban", "band", "bank",
-        "bar", "bard", "bare", "bark", "barn",
-        # o-family (adds vowel + new branching)
-        "on", "one", "only", "onto",
+        "bar", "bark", "barn",
+        "be", "bet",
+        # o-family (adds vowel + new branching after 'o')
+        "on", "one", "or",
     ],
 }
 

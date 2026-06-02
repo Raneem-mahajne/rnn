@@ -4,44 +4,44 @@ Visualize a trained min-char-rnn after training is done.
 Loads the saved model from `model.npz`, runs a forward pass over the first
 `--length` characters of `input.txt`, and plots:
 
-  1) hidden_states_heatmap.png
+  1) activation_heatmap.png
        Heatmap of every hidden unit's activation at every timestep.
        Y-axis: hidden units (h0, h1, ...). X-axis: input character.
        Works for any `hidden_size`.
 
-  2) output_probabilities.png
+  2) next_char_prob_sequence_heatmap.png
        Heatmap of the model's next-char probability distribution at every
        position, with the actual next character marked.
 
-  3) hidden_states_trajectory.png   (only when hidden_size == 2)
+  3) state_trajectory_by_input.png   (only when hidden_size == 2)
        2D scatter of every hidden state visited, colored by the input
        character that produced it, with grey arrows showing the temporal
        trajectory through state space.
 
-  4) hidden_states_by_target.png    (only when hidden_size == 2)
+  4) state_trajectory_by_target.png    (only when hidden_size == 2)
        Same scatter, colored by the *next* (target) character.
 
   5) learning_curve.png
        Per-window training loss vs iteration (from model.npz).
 
-  6) hidden_states_pca_context_labels.png
-       2D PCA of hidden states; annotation = prev2 + current char (3 chars).
+  6) embedding_panels_context.png
+       2D embeddings (PCA/UMAP/t-SNE/Isomap) of hidden states with context labels.
 
-  7) hidden_states_pca_prediction_regions.png
+  7) next_char_regions_pca.png
        Two PCA panels: argmax next-char regions and prediction entropy (2D h).
 
-  8) hidden_states_pca_next_char_prob_panels.png
+  8) next_char_prob_panels_pca.png
        One panel per vocab char: P(next = char) over the PCA plane (softmax).
 
-  9) hidden_states_clustermap.png
+  9) activation_clustered_heatmap.png
        Heatmap of timesteps × hidden units with row/column dendrograms
        (average linkage). Row labels: two preceding chars + current char.
 
-  10) hidden_states_correlation_clustermap.png
+  10) state_correlation_clustered_heatmap.png
        Timestep × timestep Pearson correlation of hidden states, hierarchically
        clustered; row/column labels = prefix since last space; tick colors = min DFA state.
 
-  11) hidden_states_dfa_distance_comparison.png
+  11) dfa_state_distance_comparison.png
        Pairwise Euclidean distances between hidden states; bars = within vs between
        minimized DFA state (all timestep pairs in the test window).
 
@@ -50,7 +50,7 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
 Usage:
-    python visualize.py --exp shared_letters
+    python visualize.py --exp ten_word_overlap_s
     python visualize.py --exp ten_word_overlap --length 100
     python visualize.py --model path/to/model.npz --input path/to/input.txt --out-dir path/to/plots
 """
@@ -1527,16 +1527,70 @@ def plot_space_to_space_trajectories(
     text: str,
     hidden_states: np.ndarray,
     save_path: str,
+    *,
+    model=None,
+    free_rollout_steps: int = 10,
 ):
-    """PCA plot of every hidden-state path from one space timestep to the next."""
+    """PCA plot of every hidden-state path from one space timestep to the next.
+
+    If `model` is provided, draw the no-input recurrent vector field in PCA
+    as a faint background quiver grid.
+    """
     segments = space_to_space_segments(text)
     if len(text) < 2 or not segments:
         return
 
-    projected, _, _ = fit_pca_2d(hidden_states)
+    projected, mean, components, _ = fit_pca_2d_with_evr(hidden_states)
     word_colors = _word_trajectory_colors(segments)
 
-    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(22, 11), constrained_layout=True)
+    ax_paths, ax_free = axes[0], axes[1]
+
+    # Background: no-input recurrent dynamics vector field in PCA (optional).
+    x_min = x_max = y_min = y_max = None
+    grid_x = grid_y = U = V = None
+    if model is not None:
+        z = projected
+        x_min, x_max = float(np.min(z[:, 0])), float(np.max(z[:, 0]))
+        y_min, y_max = float(np.min(z[:, 1])), float(np.max(z[:, 1]))
+        x_pad = max((x_max - x_min) * 0.08, 1e-3)
+        y_pad = max((y_max - y_min) * 0.08, 1e-3)
+        x_min, x_max = x_min - x_pad, x_max + x_pad
+        y_min, y_max = y_min - y_pad, y_max + y_pad
+
+        grid_resolution = 26
+        xs = np.linspace(x_min, x_max, grid_resolution)
+        ys = np.linspace(y_min, y_max, grid_resolution)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        z_grid = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+
+        h = reconstruct_from_pca(z_grid, mean, components)
+        W_hh = np.asarray(model["weights_hidden_to_hidden"])
+        b_h = np.asarray(model["bias_hidden"]).ravel()
+        h_next = np.tanh(h @ W_hh.T + b_h)
+        z_next = (h_next - mean) @ components.T
+        d = z_next - z_grid
+        U = d[:, 0].reshape(grid_resolution, grid_resolution)
+        V = d[:, 1].reshape(grid_resolution, grid_resolution)
+
+        # Match the smaller-arrow settings used in vector_field_grid_pca_no_input.png
+        for ax in (ax_paths, ax_free):
+            ax.quiver(
+                grid_x,
+                grid_y,
+                U,
+                V,
+                angles="xy",
+                scale_units="xy",
+                scale=35.0,
+                width=0.0022,
+                headwidth=3.6,
+                headlength=4.6,
+                headaxislength=3.6,
+                color="#000000",
+                alpha=0.18,
+                zorder=1,
+            )
 
     for start, end, segment_text in segments:
         path = projected[start : end + 1]
@@ -1544,29 +1598,84 @@ def plot_space_to_space_trajectories(
             continue
         color = word_colors[segment_word_label(segment_text)]
 
-        ax.plot(
+        ax_paths.plot(
             path[:, 0], path[:, 1],
             color=color, linewidth=1.6, alpha=0.55, solid_capstyle="round", zorder=2,
         )
         if len(path) >= 2:
-            ax.quiver(
+            ax_paths.quiver(
                 path[:-1, 0], path[:-1, 1],
                 path[1:, 0] - path[:-1, 0], path[1:, 1] - path[:-1, 1],
                 angles="xy", scale_units="xy", scale=1,
                 color=color, width=0.005, headwidth=4.5, headlength=5.5,
                 headaxislength=4.5, alpha=0.95, zorder=3,
             )
-        ax.scatter(
+        ax_paths.scatter(
             path[:, 0], path[:, 1],
             s=32, c=[color] * len(path),
             edgecolors="black", linewidths=0.4, zorder=4,
         )
 
+    # Panel 2: free dynamics rollouts from each observed hidden state (no input).
+    if model is not None and free_rollout_steps > 0:
+        W_hh = np.asarray(model["weights_hidden_to_hidden"])
+        b_h = np.asarray(model["bias_hidden"]).ravel()
+
+        # Map each timestep to its containing word label for coloring.
+        word_at_t = [""] * len(text)
+        for start, end, segment_text in segments:
+            word = segment_word_label(segment_text)
+            for t in range(start, end + 1):
+                if 0 <= t < len(word_at_t):
+                    word_at_t[t] = word
+
+        # Start points (actual states), colored by word.
+        start_colors = [word_colors.get(word_at_t[t], (0.2, 0.2, 0.2, 1.0)) for t in range(len(text))]
+        ax_free.scatter(
+            projected[:, 0],
+            projected[:, 1],
+            s=16,
+            c=start_colors,
+            alpha=0.35,
+            edgecolors="black",
+            linewidths=0.25,
+            zorder=2,
+        )
+
+        for t, h0 in enumerate(hidden_states):
+            h = np.asarray(h0, dtype=float)
+            zs = [projected[t]]  # start exactly at the observed point
+            for _ in range(int(free_rollout_steps)):
+                h = np.tanh(W_hh @ h + b_h)
+                z = (h - mean) @ components.T
+                zs.append(z)
+            zs = np.asarray(zs, dtype=float)
+            if zs.shape[0] < 2:
+                continue
+            color = word_colors.get(word_at_t[t], "0.15")
+            ax_free.plot(zs[:, 0], zs[:, 1], color=color, linewidth=1.0, alpha=0.22, zorder=3)
+            ax_free.quiver(
+                zs[:-1, 0],
+                zs[:-1, 1],
+                zs[1:, 0] - zs[:-1, 0],
+                zs[1:, 1] - zs[:-1, 1],
+                angles="xy",
+                scale_units="xy",
+                scale=1,
+                color=color,
+                width=0.0032,
+                headwidth=4.0,
+                headlength=5.0,
+                headaxislength=4.0,
+                alpha=0.45,
+                zorder=4,
+            )
+
     handles = [
         Patch(facecolor=word_colors[w], edgecolor="#333333", label=w)
         for w in sorted(word_colors)
     ]
-    ax.legend(
+    ax_paths.legend(
         handles=handles,
         title="word",
         loc="upper left",
@@ -1576,14 +1685,115 @@ def plot_space_to_space_trajectories(
         framealpha=0.95,
     )
 
+    for ax in (ax_paths, ax_free):
+        ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+        ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.grid(True, linestyle=":", alpha=0.35)
+        if x_min is not None and y_min is not None:
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+
+    ax_paths.set_title(f"Observed word trajectories (PCA) ({len(segments)} segments, {len(text)} chars)")
+    ax_free.set_title(
+        f"Free dynamics from observed states (no input)\n"
+        f"{len(text)} start states × {free_rollout_steps} steps"
+    )
+
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
+def plot_pca_vector_field(
+    text: str,
+    hidden_states: np.ndarray,
+    model,
+    save_path: str,
+    *,
+    grid_resolution: int = 26,
+    stride: int = 1,
+    scale: float = 35.0,
+) -> None:
+    """Grid vector field in PCA: z -> z' from no-input recurrent dynamics.
+
+    We reconstruct h from each (PC1,PC2) grid point, apply one recurrent step with x=0,
+    then project back to PCA to get the vector z' - z.
+    """
+    if len(text) < 3 or hidden_states.shape[0] < 3:
+        return
+
+    projected, mean, components, evr = fit_pca_2d_with_evr(hidden_states)
+    z = projected
+
+    x_min, x_max = float(np.min(z[:, 0])), float(np.max(z[:, 0]))
+    y_min, y_max = float(np.min(z[:, 1])), float(np.max(z[:, 1]))
+    x_pad = max((x_max - x_min) * 0.08, 1e-3)
+    y_pad = max((y_max - y_min) * 0.08, 1e-3)
+    x_min, x_max = x_min - x_pad, x_max + x_pad
+    y_min, y_max = y_min - y_pad, y_max + y_pad
+
+    xs = np.linspace(x_min, x_max, grid_resolution)
+    ys = np.linspace(y_min, y_max, grid_resolution)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    z_grid = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+
+    # z -> h (2D PCA reconstruction)
+    h = reconstruct_from_pca(z_grid, mean, components)
+
+    # No-input recurrent step: h' = tanh(Whh h + b)
+    W_hh = np.asarray(model["weights_hidden_to_hidden"])
+    b_h = np.asarray(model["bias_hidden"]).ravel()
+    h_next = np.tanh(h @ W_hh.T + b_h)
+
+    # h' -> z' via the same PCA projection
+    z_next = (h_next - mean) @ components.T
+    d = z_next - z_grid
+
+    U = d[:, 0].reshape(grid_resolution, grid_resolution)
+    V = d[:, 1].reshape(grid_resolution, grid_resolution)
+    mask = np.ones_like(U, dtype=bool)
+    if stride > 1:
+        mask[:] = False
+        mask[::stride, ::stride] = True
+
+    fig, ax = plt.subplots(figsize=(10.5, 9.0), constrained_layout=True)
+    ax.scatter(
+        z[:, 0],
+        z[:, 1],
+        s=14,
+        c="0.4",
+        alpha=0.22,
+        edgecolors="none",
+        zorder=1,
+    )
+    ax.quiver(
+        grid_x[mask],
+        grid_y[mask],
+        U[mask],
+        V[mask],
+        angles="xy",
+        scale_units="xy",
+        scale=max(scale, 1e-6),
+        width=0.0026,
+        headwidth=4.0,
+        headlength=5.0,
+        headaxislength=4.0,
+        color="#000000",
+        alpha=0.9,
+        zorder=3,
+    )
+
+    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+    ax.set_xlabel(f"PC1 ({pc1:.1f}%)")
+    ax.set_ylabel(f"PC2 ({pc2:.1f}%)")
+    ax.set_title("Vector field in PCA (grid; no-input recurrent dynamics)")
     ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title(
-        f"Space-to-space trajectories in PCA ({len(segments)} segments, "
-        f"{len(text)} chars)"
-    )
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     ax.grid(True, linestyle=":", alpha=0.35)
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -2094,31 +2304,31 @@ def main() -> None:
 
     plot_hidden_states_heatmap(
         text, hidden_states,
-        save_path=os.path.join(out_dir, "hidden_states_heatmap.png"),
+        save_path=os.path.join(out_dir, "activation_heatmap.png"),
     )
 
     plot_output_probs(
         text, output_probs, model["chars"],
-        save_path=os.path.join(out_dir, "output_probabilities.png"),
+        save_path=os.path.join(out_dir, "next_char_prob_sequence_heatmap.png"),
     )
 
     plot_per_char_hidden_state_heatmaps(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_by_input_char.png"),
+        save_path=os.path.join(out_dir, "activation_by_input_char.png"),
         cluster_rows=not args.no_cluster_per_char,
         spaced=spaced,
     )
 
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_pca_context_labels.png"),
+        save_path=os.path.join(out_dir, "embedding_panels_context.png"),
         spaced=spaced,
         automaton=automaton,
     )
 
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_pca_prediction_regions.png"),
+        save_path=os.path.join(out_dir, "next_char_regions_pca.png"),
         spaced=spaced,
         automaton=automaton,
     )
@@ -2126,7 +2336,7 @@ def main() -> None:
     if automaton is not None and words:
         plot_pca_dfa_analysis(
             text, hidden_states, model["chars"], words,
-            save_path=os.path.join(out_dir, "hidden_states_pca_dfa_analysis.png"),
+            save_path=os.path.join(out_dir, "dfa_and_embedding_pca.png"),
             automaton=automaton,
             spaced=spaced,
             annot_style=args.dfa_annot_style,
@@ -2136,26 +2346,34 @@ def main() -> None:
         plot_space_to_space_trajectories(
             text, hidden_states,
             save_path=os.path.join(
-                out_dir, "hidden_states_space_to_space_trajectories.png"
+                out_dir, "word_trajectories_pca.png"
             ),
+            model=model,
         )
 
     plot_pca_next_char_probability_panels(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_pca_next_char_prob_panels.png"),
+        save_path=os.path.join(out_dir, "next_char_prob_panels_pca.png"),
         spaced=spaced,
         automaton=automaton,
     )
 
+    plot_pca_vector_field(
+        text,
+        hidden_states,
+        model,
+        os.path.join(out_dir, "vector_field_grid_pca_no_input.png"),
+    )
+
     plot_hidden_states_clustermap(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_clustermap.png"),
+        save_path=os.path.join(out_dir, "activation_clustered_heatmap.png"),
         exp_name=args.exp,
     )
 
     plot_hidden_states_correlation_clustermap(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "hidden_states_correlation_clustermap.png"),
+        save_path=os.path.join(out_dir, "state_correlation_clustered_heatmap.png"),
         spaced=spaced,
         automaton=automaton,
     )
@@ -2163,7 +2381,7 @@ def main() -> None:
     if automaton is not None:
         plot_dfa_state_distance_comparison(
             text, hidden_states, automaton,
-            save_path=os.path.join(out_dir, "hidden_states_dfa_distance_comparison.png"),
+            save_path=os.path.join(out_dir, "dfa_state_distance_comparison.png"),
             spaced=spaced,
         )
 
@@ -2173,14 +2391,14 @@ def main() -> None:
             color_by_chars=list(text),
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by INPUT char)",
-            save_path=os.path.join(out_dir, "hidden_states_trajectory.png"),
+            save_path=os.path.join(out_dir, "state_trajectory_by_input.png"),
         )
         plot_state_trajectory(
             hidden_states,
             color_by_chars=targets,
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by TARGET / next char)",
-            save_path=os.path.join(out_dir, "hidden_states_by_target.png"),
+            save_path=os.path.join(out_dir, "state_trajectory_by_target.png"),
         )
 
     correct = np.sum(np.argmax(output_probs, axis=1) ==

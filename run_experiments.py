@@ -37,7 +37,7 @@ def main() -> None:
     names = args.only if args.only else list(EXPERIMENT_CONFIG.keys())
 
     for name in names:
-        cfg = EXPERIMENT_CONFIG.get(name, EXPERIMENT_CONFIG["shared_letters"])
+        cfg = EXPERIMENT_CONFIG.get(name, next(iter(EXPERIMENT_CONFIG.values())))
         regime = experiment_regime(name)
         print(f"\n=== {name} ===")
 
