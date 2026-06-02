@@ -30,6 +30,8 @@ parser.add_argument('--input', default='input.txt',
                     help='training corpus path (default: input.txt)')
 parser.add_argument('--model', default='model.npz',
                     help='where to save trained weights (default: model.npz)')
+parser.add_argument('--hidden-size', type=int, default=2,
+                    help='number of recurrent units (default: 2)')
 args = parser.parse_args()
 
 # ----- data I/O ---------------------------------------------------------------
@@ -44,7 +46,7 @@ index_to_char = { i: char for i, char in enumerate(unique_chars) }  # int id -> 
 vocab_words = set(text.split()) if (" " in text) else set()
 
 # ----- hyperparameters --------------------------------------------------------
-hidden_size = 10           # number of recurrent units in the hidden layer
+hidden_size = args.hidden_size  # number of recurrent units in the hidden layer
 sequence_length = 25       # backprop-through-time window: longer = more context but slower / harder to train
 learning_rate = 1e-1       # Adagrad base step size
 

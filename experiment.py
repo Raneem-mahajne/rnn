@@ -12,6 +12,8 @@ _BASE_CONFIG: dict[str, dict[str, int]] = {
     "ten_word_overlap": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
     "twelve_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
     "sixteen_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
+    "six_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
+    "six_word_overlap_sin": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
 }
 
 

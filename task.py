@@ -31,29 +31,43 @@ REGIMES: dict[str, list[str]] = {
         "met", "pet", "net",
         "ate", "eat", "tea",
     ],
-    # 12 words with shared prefixes and mixed lengths (richer minimal DFA).
-    # Designed to have branching after the *first* character too (a→{n,t,x}, b→{a,e}).
-    "twelve_word_overlap": [
-        # a-family (splits after 'a')
-        "an", "ant", "ante", "anti",
-        "at",
-        "ax",
-        # b-family (splits after 'b')
-        "ban", "band", "bank",
-        "be", "bet", "bent",
+    # 6 words: one -at suffix family + one co- prefix family.
+    "six_word_overlap": [
+        "cat", "hat", "mat",
+        "con", "cob", "cot",
     ],
-    # 16 words with richer prefix branching and an extra vowel (o).
-    # Also designed to have branching after the *first* character in each family.
+    # 6 words: one -at suffix family + one si- prefix family.
+    "six_word_overlap_sin": [
+        "sin", "six", "sir",
+        "cat", "hat", "mat",
+    ],
+    # 12 real words: user-specified overlaps (plus one to make 12).
+    "twelve_word_overlap": [
+        "ban",
+        "rot",
+        "cat", "hat", "mat",  # suffix -at
+        "con", "cob", "cot",  # prefix co-
+        "son",
+        "din",
+        "fun",
+        "bun",  # added (real word) to make 12; overlaps with fun on -un
+    ],
+    # 16 real words: more suffix/prefix groups plus independents.
     "sixteen_word_overlap": [
-        # a-family
-        "an", "ant", "ante", "anti",
-        "at",
-        # b-family
-        "ban", "band", "bank",
-        "bar", "bark", "barn",
-        "be", "bet",
-        # o-family (adds vowel + new branching after 'o')
-        "on", "one", "or",
+        # same suffix -at
+        "cat", "hat", "mat", "rat",
+        # same suffix -et
+        "met", "pet", "net",
+        # same suffix -an
+        "can", "ban", "pan",
+        # same suffix -ar
+        "car", "bar", "tar",
+        # same prefix an- (2 letters)
+        "ant", "and",
+        # same prefix be- (2 letters)
+        "bed", "bet",
+        # independent
+        "tea", "oil",
     ],
 }
 

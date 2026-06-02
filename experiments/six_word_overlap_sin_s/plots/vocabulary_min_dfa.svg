@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="371" height="819" viewBox="0 0 371 819">
+<style>text { font-family: ui-monospace, Consolas, monospace; font-size: 13px; fill: #111; }.edge-label { font-size: 12px; fill: #222; }.state-label { font-size: 11px; fill: #1a1a1a; }.title { font-size: 15px; font-weight: 600; fill: #111; }</style>
+<rect x="0" y="0" width="371" height="819" fill="#f4f1ea"/>
+<text x="50" y="28" class="title">Minimal DFA · sin, six, sir, cat, hat, mat</text>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/></marker>
+</defs>
+<path d="M 194.9 113.7 Q 185.7 196.9 129.1 258.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 194.9 113.7 L 129.1 258.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 194.9 113.7 Q 138.3 175.3 129.1 258.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 216.4 113.7 L 284.9 264.4" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 114.0 324.1 L 114.0 457.8" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 297.3 317.7 L 297.3 463.3" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 127.0 522.0 L 185.0 649.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 286.6 517.0 Q 280.1 594.0 226.4 649.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 286.6 517.0 L 226.4 649.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 286.6 517.0 Q 232.8 572.5 226.4 649.5" fill="none" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="145.7" y1="90.0" x2="179.7" y2="90.0" stroke="#444" stroke-width="1.2" marker-end="url(#arrow)"/>
+<circle cx="205.7" cy="90.0" r="24.0" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="205.7" y="90.0" text-anchor="middle" dominant-baseline="central" class="state-label" font-size="10px">{ε}</text>
+<circle cx="114.0" cy="291.7" r="30.4" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="114.0" y="285.2" text-anchor="middle" class="state-label" font-size="10px"><tspan x="114.0" dy="0">{c, h,</tspan><tspan x="114.0" dy="13">{m}</tspan></text>
+<circle cx="297.3" cy="291.7" r="24.0" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="297.3" y="291.7" text-anchor="middle" dominant-baseline="central" class="state-label" font-size="10px">{s}</text>
+<circle cx="114.0" cy="493.3" r="29.5" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="114.0" y="480.3" text-anchor="middle" class="state-label" font-size="10px"><tspan x="114.0" dy="0">{ca,</tspan><tspan x="114.0" dy="13">{ha,</tspan><tspan x="114.0" dy="13">{ma}</tspan></text>
+<circle cx="297.3" cy="493.3" r="24.0" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="297.3" y="493.3" text-anchor="middle" dominant-baseline="central" class="state-label" font-size="10px">{si}</text>
+<circle cx="205.7" cy="695.0" r="48.0" fill="none" stroke="#111" stroke-width="1.5"/>
+<circle cx="205.7" cy="695.0" r="44.0" fill="#ffffff" stroke="#111" stroke-width="1.5"/>
+<text x="205.7" y="682.0" text-anchor="middle" class="state-label" font-size="9px"><tspan x="205.7" dy="0">{cat, hat,</tspan><tspan x="205.7" dy="13">{mat, sin,</tspan><tspan x="205.7" dy="13">{sir, six}</tspan></text>
+<text x="159.3" y="184.9" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">c</text>
+<text x="159.3" y="184.9" text-anchor="middle" dominant-baseline="central" class="edge-label">c</text>
+<text x="176.6" y="192.7" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">h</text>
+<text x="176.6" y="192.7" text-anchor="middle" dominant-baseline="central" class="edge-label">h</text>
+<text x="135.6" y="174.1" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">m</text>
+<text x="135.6" y="174.1" text-anchor="middle" dominant-baseline="central" class="edge-label">m</text>
+<text x="236.1" y="195.6" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">s</text>
+<text x="236.1" y="195.6" text-anchor="middle" dominant-baseline="central" class="edge-label">s</text>
+<text x="98.0" y="390.9" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">a</text>
+<text x="98.0" y="390.9" text-anchor="middle" dominant-baseline="central" class="edge-label">a</text>
+<text x="281.3" y="390.5" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">i</text>
+<text x="281.3" y="390.5" text-anchor="middle" dominant-baseline="central" class="edge-label">i</text>
+<text x="141.4" y="592.4" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">t</text>
+<text x="141.4" y="592.4" text-anchor="middle" dominant-baseline="central" class="edge-label">t</text>
+<text x="253.7" y="582.0" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">n</text>
+<text x="253.7" y="582.0" text-anchor="middle" dominant-baseline="central" class="edge-label">n</text>
+<text x="271.0" y="589.9" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">r</text>
+<text x="271.0" y="589.9" text-anchor="middle" dominant-baseline="central" class="edge-label">r</text>
+<text x="230.1" y="571.2" text-anchor="middle" dominant-baseline="central" class="edge-label" stroke="#f4f1ea" stroke-width="5" paint-order="stroke">x</text>
+<text x="230.1" y="571.2" text-anchor="middle" dominant-baseline="central" class="edge-label">x</text>
+</svg>

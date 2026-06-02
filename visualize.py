@@ -429,7 +429,7 @@ def original_vocabulary_title(chars, text: str | None = None) -> str:
 def plot_hidden_states_clustermap(
     text, hidden_states, chars, save_path, *, exp_name: str | None = None
 ):
-    """Heatmap (timesteps × hidden units) with seaborn clustermap layout."""
+    """Heatmap (hidden units × timesteps) with seaborn clustermap layout."""
     n_rows, n_cols = hidden_states.shape
     if n_rows == 0:
         return
@@ -437,7 +437,8 @@ def plot_hidden_states_clustermap(
     spaced = corpus_uses_word_spacing(text, exp_name)
     row_labels = [timestep_context_label(text, t, spaced=spaced) for t in range(n_rows)]
     col_labels = [f"h{i}" for i in range(n_cols)]
-    data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels)
+    # Flip orientation: units on rows, timesteps on columns (makes long sequences readable).
+    data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels).T
 
     grid = sns.clustermap(
         data,
@@ -447,19 +448,19 @@ def plot_hidden_states_clustermap(
         vmin=-1,
         vmax=1,
         center=0,
-        figsize=(max(9, n_cols * 0.55), max(6, n_rows * 0.25)),
+        figsize=(max(10, n_rows * 0.24), max(6, n_cols * 0.55)),
         dendrogram_ratio=(0.12, 0.1),
         cbar=False,
         cbar_pos=None,
         xticklabels=True,
         yticklabels=True,
     )
-    grid.ax_heatmap.set_xlabel("hidden unit")
-    grid.ax_heatmap.set_ylabel(timestep_axis_description(text, exp_name))
-    grid.ax_heatmap.tick_params(axis="y", labelsize=7)
-    grid.ax_heatmap.tick_params(axis="x", labelsize=8)
+    grid.ax_heatmap.set_xlabel(timestep_axis_description(text, exp_name))
+    grid.ax_heatmap.set_ylabel("hidden unit")
+    grid.ax_heatmap.tick_params(axis="y", labelsize=8)
+    grid.ax_heatmap.tick_params(axis="x", labelsize=7)
     grid.fig.suptitle(
-        f"Hidden states clustered (timesteps × units) · {original_vocabulary_title(chars, text)}",
+        f"Hidden states clustered (units × timesteps) · {original_vocabulary_title(chars, text)}",
         y=1.02, fontsize=11,
     )
     grid.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -917,7 +918,22 @@ def _layout_group_label_positions(
     )
     label_offset = span * 0.14
     label_positions = {}
-    for key, indices in groups.items():
+
+    def _rot(v: np.ndarray, deg: float) -> np.ndarray:
+        t = np.deg2rad(deg)
+        c, s = float(np.cos(t)), float(np.sin(t))
+        return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+
+    # Try a small set of angles so leader labels don't overlap each other.
+    # (We approximate overlap using label center distance in data units.)
+    angle_candidates_deg = [0, 18, -18, 36, -36, 54, -54, 72, -72, 90, -90, 120, -120, 150, -150, 180]
+    min_sep = label_offset * 0.65
+
+    # Place "harder" groups first (those nearer the center tend to collide more).
+    items = list(groups.items())
+    items.sort(key=lambda kv: float(np.linalg.norm(projected[kv[1]].mean(axis=0) - center)))
+
+    for key, indices in items:
         points = projected[indices]
         centroid = points.mean(axis=0)
         outward = centroid - center
@@ -926,7 +942,17 @@ def _layout_group_label_positions(
             outward = np.array([0.0, 1.0])
         else:
             outward = outward / norm
-        label_positions[key] = centroid + outward * label_offset
+
+        best = centroid + outward * label_offset
+        for deg in angle_candidates_deg:
+            cand = centroid + _rot(outward, deg) * label_offset
+            if not label_positions:
+                best = cand
+                break
+            if all(float(np.linalg.norm(cand - p)) >= min_sep for p in label_positions.values()):
+                best = cand
+                break
+        label_positions[key] = best
     return label_positions
 
 
@@ -1512,7 +1538,7 @@ def plot_pca_context_labels(
         save_path,
         spaced=spaced,
         automaton=automaton,
-        annot_style="annots_only",
+        annot_style="leaders",
     )
 
 
@@ -1913,24 +1939,49 @@ def plot_pca_dfa_analysis(
     *,
     spaced: bool = False,
     annot_style: str = "leaders",
+    embedding: str = "umap",
 ):
-    """Plain PCA (DFA-colored points) beside the min-DFA with matching state colors."""
+    """Embedding (default: UMAP) beside the min-DFA with matching state colors."""
     if len(text) < 2:
         return
-    projected, _, _, evr = fit_pca_2d_with_evr(hidden_states)
+    embedding = (embedding or "umap").lower()
+    if embedding == "pca":
+        projected, _, _, evr = fit_pca_2d_with_evr(hidden_states)
+        xlabel = f"PC1 ({100.0 * float(evr[0]):.1f}%)" if len(evr) > 0 else "PC1"
+        ylabel = f"PC2 ({100.0 * float(evr[1]):.1f}%)" if len(evr) > 1 else "PC2"
+        embed_title = "2D PCA"
+        embed_subtitle = (
+            f"variance explained: PC1 {100.0 * float(evr[0]):.1f}%, PC2 {100.0 * float(evr[1]):.1f}%"
+            if len(evr) > 1
+            else ""
+        )
+    else:
+        # Lazy import: optional dependency.
+        from umap import UMAP  # type: ignore
+
+        n = hidden_states.shape[0]
+        projected = UMAP(
+            n_components=2,
+            n_neighbors=min(15, max(2, n - 1)),
+            min_dist=0.1,
+            random_state=0,
+        ).fit_transform(hidden_states)
+        xlabel, ylabel = "UMAP-1", "UMAP-2"
+        embed_title = "UMAP"
+        embed_subtitle = ""
     state_ids = [
         dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(len(text))
     ]
     state_colors = _state_id_colors(state_ids)
 
     fig, axes = plt.subplots(1, 2, figsize=(28, 11), constrained_layout=True)
-    ax_dfa, ax_pca = axes[0], axes[1]
+    ax_dfa, ax_embed = axes[0], axes[1]
 
     draw_minimized_dfa_on_axes(ax_dfa, automaton, words, state_colors=state_colors)
     ax_dfa.set_title("Minimal DFA", fontsize=12, pad=12)
 
     text_positions = add_dfa_state_annotations(
-        ax_pca, text, projected, automaton,
+        ax_embed, text, projected, automaton,
         spaced=spaced, state_colors=state_colors,
         point_size=160,
         label_fontsize=18,
@@ -1938,22 +1989,21 @@ def plot_pca_dfa_analysis(
         annot_style=annot_style,
     )
     _expand_limits_for_annotations(
-        ax_pca, projected, text_positions,
+        ax_embed, projected, text_positions,
         (projected[:, 0].min(), projected[:, 0].max()),
         (projected[:, 1].min(), projected[:, 1].max()),
     )
-    ax_pca.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    ax_pca.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
-    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
-    ax_pca.set_xlabel(f"PC1 ({pc1:.1f}%)")
-    ax_pca.set_ylabel(f"PC2 ({pc2:.1f}%)")
+    ax_embed.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax_embed.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax_embed.set_xlabel(xlabel)
+    ax_embed.set_ylabel(ylabel)
     ctx = "prefix since last space" if spaced else "stream prefix"
-    ax_pca.set_title(f"2D PCA (min DFA state · {ctx})\nvariance explained: PC1 {pc1:.1f}%, PC2 {pc2:.1f}%")
-    ax_pca.grid(True, linestyle=":", alpha=0.35)
-    ax_pca.spines["top"].set_visible(False)
-    ax_pca.spines["right"].set_visible(False)
-    ax_pca.tick_params(top=False, right=False)
+    subtitle = f"\n{embed_subtitle}" if embed_subtitle else ""
+    ax_embed.set_title(f"{embed_title} (min DFA state · {ctx}){subtitle}")
+    ax_embed.grid(True, linestyle=":", alpha=0.35)
+    ax_embed.spines["top"].set_visible(False)
+    ax_embed.spines["right"].set_visible(False)
+    ax_embed.tick_params(top=False, right=False)
 
     fig.suptitle(", ".join(words), fontsize=12, y=1.01)
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
@@ -2358,7 +2408,7 @@ def main() -> None:
                         help="keep per-character heatmap rows in sequence order")
     parser.add_argument(
         "--dfa-annot-style",
-        default="annots_only",
+        default="leaders",
         choices=["leaders", "none", "annots_only"],
         help="DFA annotation style for hidden_states_pca_dfa_analysis.png",
     )
