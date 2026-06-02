@@ -1530,6 +1530,8 @@ def plot_space_to_space_trajectories(
     *,
     model=None,
     free_rollout_steps: int = 10,
+    closed_loop_steps: int | None = None,
+    closed_loop_seed: int = 0,
 ):
     """PCA plot of every hidden-state path from one space timestep to the next.
 
@@ -1543,8 +1545,16 @@ def plot_space_to_space_trajectories(
     projected, mean, components, _ = fit_pca_2d_with_evr(hidden_states)
     word_colors = _word_trajectory_colors(segments)
 
-    fig, axes = plt.subplots(1, 2, figsize=(22, 11), constrained_layout=True)
-    ax_paths, ax_free = axes[0], axes[1]
+    if closed_loop_steps is None:
+        closed_loop_steps = len(text)
+
+    ncols = 3 if model is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(22 if ncols == 2 else 30, 11), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    # Panel order: internal (no input), trained (observed), closed-loop (self-fed).
+    ax_free = axes[0] if ncols >= 2 else None
+    ax_paths = axes[1] if ncols >= 2 else axes[0]
+    ax_gen = axes[2] if ncols >= 3 else None
 
     # Background: no-input recurrent dynamics vector field in PCA (optional).
     x_min = x_max = y_min = y_max = None
@@ -1574,7 +1584,7 @@ def plot_space_to_space_trajectories(
         V = d[:, 1].reshape(grid_resolution, grid_resolution)
 
         # Match the smaller-arrow settings used in vector_field_grid_pca_no_input.png
-        for ax in (ax_paths, ax_free):
+        for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
             ax.quiver(
                 grid_x,
                 grid_y,
@@ -1592,6 +1602,7 @@ def plot_space_to_space_trajectories(
                 zorder=1,
             )
 
+    # Panel: trained (observed) trajectories colored by true word segment.
     for start, end, segment_text in segments:
         path = projected[start : end + 1]
         if len(path) == 0:
@@ -1617,7 +1628,7 @@ def plot_space_to_space_trajectories(
         )
 
     # Panel 2: free dynamics rollouts from each observed hidden state (no input).
-    if model is not None and free_rollout_steps > 0:
+    if ax_free is not None and model is not None and free_rollout_steps > 0:
         W_hh = np.asarray(model["weights_hidden_to_hidden"])
         b_h = np.asarray(model["bias_hidden"]).ravel()
 
@@ -1671,6 +1682,92 @@ def plot_space_to_space_trajectories(
                 zorder=4,
             )
 
+    # Panel 3: closed-loop generation (sampled; previous output fed back as input).
+    if ax_gen is not None and model is not None and closed_loop_steps > 1:
+        rng = np.random.default_rng(int(closed_loop_seed))
+        chars = list(model["chars"])
+        char_to_index = {c: i for i, c in enumerate(chars)}
+        vocab_size = len(chars)
+
+        W_xh = np.asarray(model["weights_input_to_hidden"])
+        W_hh = np.asarray(model["weights_hidden_to_hidden"])
+        W_ho = np.asarray(model["weights_hidden_to_output"])
+        b_h = np.asarray(model["bias_hidden"]).ravel()
+        b_o = np.asarray(model["bias_output"]).ravel()
+
+        # Seed with the first character of the observed window (keeps vocab consistent).
+        seed_char = text[0] if text else chars[0]
+        if seed_char not in char_to_index:
+            seed_char = chars[0]
+
+        h = np.zeros(hidden_states.shape[1], dtype=float)
+        generated = [seed_char]
+        gen_h = []
+
+        prev_char = seed_char
+        for _ in range(int(closed_loop_steps)):
+            x = np.zeros((vocab_size,), dtype=float)
+            x[char_to_index[prev_char]] = 1.0
+            h = np.tanh(W_xh @ x + W_hh @ h + b_h)
+            gen_h.append(h.copy())
+
+            logits = W_ho @ h + b_o
+            logits = logits - np.max(logits)
+            probs = np.exp(logits)
+            probs = probs / np.sum(probs)
+            next_ix = int(rng.choice(vocab_size, p=probs))
+            next_char = chars[next_ix]
+            generated.append(next_char)
+            prev_char = next_char
+
+        gen_h = np.asarray(gen_h, dtype=float)
+        gen_z = (gen_h - mean) @ components.T
+
+        # Break generated characters into word segments between spaces and color by word
+        gen_text = "".join(generated[: len(gen_z)])
+        gen_segments = space_to_space_segments(gen_text)
+        if not gen_segments:
+            gen_segments = [(0, len(gen_text) - 1, gen_text)]
+
+        for start, end, seg in gen_segments:
+            if start < 0 or end < 0 or start >= len(gen_z):
+                continue
+            end = min(end, len(gen_z) - 1)
+            path = gen_z[start : end + 1]
+            if len(path) == 0:
+                continue
+            word = segment_word_label(seg)
+            color = word_colors.get(word, (0.2, 0.2, 0.2, 1.0))
+
+            ax_gen.plot(path[:, 0], path[:, 1], color=color, linewidth=1.3, alpha=0.40, zorder=2)
+            if len(path) >= 2:
+                ax_gen.quiver(
+                    path[:-1, 0],
+                    path[:-1, 1],
+                    path[1:, 0] - path[:-1, 0],
+                    path[1:, 1] - path[:-1, 1],
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1,
+                    color=color,
+                    width=0.0036,
+                    headwidth=4.0,
+                    headlength=5.0,
+                    headaxislength=4.0,
+                    alpha=0.55,
+                    zorder=4,
+                )
+            ax_gen.scatter(
+                path[:, 0],
+                path[:, 1],
+                s=18,
+                c=[color] * len(path),
+                alpha=0.55,
+                edgecolors="black",
+                linewidths=0.25,
+                zorder=3,
+            )
+
     handles = [
         Patch(facecolor=word_colors[w], edgecolor="#333333", label=w)
         for w in sorted(word_colors)
@@ -1685,7 +1782,7 @@ def plot_space_to_space_trajectories(
         framealpha=0.95,
     )
 
-    for ax in (ax_paths, ax_free):
+    for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
         ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
         ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
         ax.set_xlabel("PC1")
@@ -1695,11 +1792,17 @@ def plot_space_to_space_trajectories(
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
 
-    ax_paths.set_title(f"Observed word trajectories (PCA) ({len(segments)} segments, {len(text)} chars)")
-    ax_free.set_title(
-        f"Free dynamics from observed states (no input)\n"
-        f"{len(text)} start states × {free_rollout_steps} steps"
-    )
+    ax_paths.set_title(f"Trained (observed) trajectories (PCA)\n{len(segments)} segments, {len(text)} chars")
+    if ax_free is not None:
+        ax_free.set_title(
+            f"Internal dynamics (no input)\n"
+            f"{len(text)} start states × {free_rollout_steps} steps"
+        )
+    if ax_gen is not None:
+        ax_gen.set_title(
+            f"Closed-loop generation (sampled; self-fed)\n"
+            f"{closed_loop_steps} steps (seed={closed_loop_seed})"
+        )
 
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
