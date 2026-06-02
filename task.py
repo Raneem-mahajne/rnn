@@ -8,12 +8,7 @@ consumed by `min-char-rnn.py` unchanged.
 From: https://github.com/Raneem-mahajne/creating_transformer/tree/statistical_learning
 
 Usage:
-    python task.py                       # default: shared_letters, 50 chars
-    python task.py shared_letters
-    python task.py disjoint_letters --chars 200000
-    python task.py one_word
     python task.py ten_word_overlap --chars 50000
-    python task.py shared_letters --exp shared_letters   # -> experiments/shared_letters/input.txt
 """
 
 from __future__ import annotations
@@ -30,9 +25,6 @@ from experiment import (
 )
 
 REGIMES: dict[str, list[str]] = {
-    "one_word":         ["cat"],
-    "disjoint_letters": ["cat", "mop", "red"],
-    "shared_letters":   ["cat", "hat", "map"],
     # 10 words, length 3; overlap on -at/-et/-ea; vowels a, e, i.
     "ten_word_overlap": [
         "cat", "hat", "mat", "rat",
@@ -82,7 +74,7 @@ def generate_sequence(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("regime", nargs="?", default="shared_letters",
+    parser.add_argument("regime", nargs="?", default="ten_word_overlap",
                         choices=list(REGIMES.keys()))
     parser.add_argument("--chars", type=int, default=50,
                         help="total characters to emit (default: 50)")
