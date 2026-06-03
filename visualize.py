@@ -49,6 +49,9 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        Side-by-side heatmaps of final input weights (char columns × hidden rows)
        and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
+  13) weight_dynamics_over_training.png
+       Eight E/I-block heatmaps of W_xh and W_hh weights over training snapshots.
+
 Usage:
     python visualize.py --exp ten_word_overlap_s
     python visualize.py --exp ten_word_overlap --length 100
@@ -77,6 +80,7 @@ from experiment import (
     plots_dir,
 )
 from task import REGIMES
+from rnn_dyn import activation_label, no_input_hidden_step, rnn_hidden_step
 from vocab_diagrams import (
     MinimizedVocabAutomaton,
     build_minimized_vocabulary_automaton,
@@ -125,6 +129,25 @@ def load_model(path: str = "model.npz"):
         model["demo_rng_seed"] = int(data["demo_rng_seed"])
     if "demo_seed_char" in data.files:
         model["demo_seed_char"] = str(data["demo_seed_char"])
+    if "dale_law" in data.files:
+        model["dale_law"] = bool(data["dale_law"])
+    if "use_relu" in data.files:
+        model["use_relu"] = bool(data["use_relu"])
+    elif "dale_law" in model:
+        model["use_relu"] = model["dale_law"]
+    else:
+        model["use_relu"] = False
+    if "e_fraction" in data.files:
+        model["e_fraction"] = float(data["e_fraction"])
+    if "dale_sign" in data.files:
+        ds = data["dale_sign"]
+        model["dale_sign"] = ds if len(ds) else None
+    if "weight_snap_iterations" in data.files:
+        model["weight_snap_iterations"] = data["weight_snap_iterations"]
+        model["weight_snap_outgoing"] = data["weight_snap_outgoing"]
+        model["weight_snap_violation_frac"] = data["weight_snap_violation_frac"]
+    if "metric_word_error_frac" in data.files:
+        model["metric_word_error_frac"] = data["metric_word_error_frac"]
     return model
 
 
@@ -148,10 +171,13 @@ def forward_pass(model, text: str):
     for t, char in enumerate(text):
         input_one_hot = np.zeros((vocab_size, 1))
         input_one_hot[char_to_index[char]] = 1
-        hidden_state = np.tanh(
-            weights_input_to_hidden  @ input_one_hot +
-            weights_hidden_to_hidden @ hidden_state  +
-            bias_hidden
+        hidden_state, _ = rnn_hidden_step(
+            hidden_state,
+            input_one_hot,
+            weights_input_to_hidden,
+            weights_hidden_to_hidden,
+            bias_hidden,
+            use_relu=model.get("use_relu", False),
         )
         logits = weights_hidden_to_output @ hidden_state + bias_output
         exp = np.exp(logits - np.max(logits))
@@ -207,18 +233,19 @@ def plot_state_trajectory(hidden_states, color_by_chars, chars, title, save_path
     print(f"wrote {save_path}")
 
 
-def plot_hidden_states_heatmap(text, hidden_states, save_path):
-    """Heatmap of every hidden unit's tanh activation over the sequence.
-
-    rows = hidden units, columns = timesteps, color = activation in [-1, 1].
-    """
+def plot_hidden_states_heatmap(text, hidden_states, save_path, *, act_label: str = "tanh"):
+    """Heatmap of every hidden unit's activation over the sequence."""
     length, hidden_size = hidden_states.shape
+    use_relu = act_label == "relu"
+    cmap = "magma" if use_relu else "RdBu_r"
+    vmin = 0.0 if use_relu else -1.0
+    vmax = None if use_relu else 1.0
 
     fig, ax = plt.subplots(figsize=(max(12, length * 0.15),
                                     max(2.5, hidden_size * 0.35)))
     im = ax.imshow(
         hidden_states.T,
-        aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1,
+        aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax,
         interpolation="nearest", origin="lower",
     )
 
@@ -228,9 +255,9 @@ def plot_hidden_states_heatmap(text, hidden_states, save_path):
     ax.set_xticklabels(list(text), fontsize=7)
     ax.set_xlabel("timestep / input character")
     ax.set_ylabel("hidden unit")
-    ax.set_title("Hidden state activations (tanh output) over the input sequence")
+    ax.set_title(f"Hidden state activations ({act_label} output) over the input sequence")
 
-    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01, label="activation (tanh)")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01, label=f"activation ({act_label})")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -760,25 +787,55 @@ def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
     return grid_x, grid_y, grid_hidden, projected, xlim, ylim
 
 
+def _rolling_median(y: np.ndarray, win: int) -> np.ndarray:
+    """Centered rolling median; edges use available samples only."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n == 0 or win <= 1:
+        return y
+    out = np.empty(n)
+    half = win // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = float(np.median(y[lo:hi]))
+    return out
+
+
 def plot_learning_curve(model, save_path):
-    """Plot per-window training loss recorded during training."""
+    """Per-window CE (rolling median) and stochastic word-validity metric."""
     if "loss_iterations" not in model:
         print(f"skip {save_path}: re-run min-char-rnn.py to record loss history")
         return
 
-    iters = model["loss_iterations"]
-    window = model["loss_window"]
+    iters = np.asarray(model["loss_iterations"], dtype=int)
+    window = np.asarray(model["loss_window"], dtype=float)
+    ce_plot = _rolling_median(window, 51)
 
     fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
-    ax.plot(iters, window, color="steelblue", linewidth=1.0)
+    ax.plot(iters, ce_plot, color="steelblue", linewidth=1.2, label="CE (51-iter median)")
     ax.set_xlabel("iteration")
     ax.set_ylabel("cross-entropy (sum over BPTT window)")
-    ax.set_title("Training loss (and word-validity proxy)")
+    ax.set_title("Training: cross-entropy vs word-validity rollout")
     ax.grid(True, linestyle=":", alpha=0.4)
+    finite = ce_plot[np.isfinite(ce_plot)]
+    if finite.size:
+        hi = float(np.percentile(finite, 99.5))
+        ax.set_ylim(0, max(hi * 1.05, 1.0))
 
-    # Optional metric: fraction of letters (excluding spaces) that fall in in-vocab tokens
-    # in a short deterministic rollout from the current model state.
-    if "metric_iterations" in model and "metric_valid_vocab_letter_frac" in model:
+    if "metric_iterations" in model and "metric_word_error_frac" in model:
+        ax2 = ax.twinx()
+        ax2.plot(
+            model["metric_iterations"],
+            100.0 * np.asarray(model["metric_word_error_frac"], dtype=float),
+            color="darkorange",
+            linewidth=1.2,
+            alpha=0.9,
+        )
+        ax2.set_ylabel("% invalid words (mean stochastic rollout)")
+        ax2.set_ylim(0, 100)
+        ax.legend(loc="upper right", fontsize=8)
+    elif "metric_iterations" in model and "metric_valid_vocab_letter_frac" in model:
         ax2 = ax.twinx()
         ax2.plot(
             model["metric_iterations"],
@@ -1396,7 +1453,7 @@ def plot_per_char_hidden_state_heatmaps(
         f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
         y=0.995,
     )
-    fig.colorbar(last_image, ax=axes, fraction=0.015, pad=0.01, label="activation (tanh)")
+    fig.colorbar(last_image, ax=axes, fraction=0.015, pad=0.01, label="activation")
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"wrote {save_path}")
@@ -1603,7 +1660,8 @@ def plot_space_to_space_trajectories(
         h = reconstruct_from_pca(z_grid, mean, components)
         W_hh = np.asarray(model["weights_hidden_to_hidden"])
         b_h = np.asarray(model["bias_hidden"]).ravel()
-        h_next = np.tanh(h @ W_hh.T + b_h)
+        use_relu = bool(model.get("use_relu", False))
+        h_next = no_input_hidden_step(h, W_hh, b_h, use_relu=use_relu)
         z_next = (h_next - mean) @ components.T
         d = z_next - z_grid
         U = d[:, 0].reshape(grid_resolution, grid_resolution)
@@ -1679,11 +1737,12 @@ def plot_space_to_space_trajectories(
             zorder=2,
         )
 
+        use_relu = bool(model.get("use_relu", False))
         for t, h0 in enumerate(hidden_states):
             h = np.asarray(h0, dtype=float)
             zs = [projected[t]]  # start exactly at the observed point
             for _ in range(int(free_rollout_steps)):
-                h = np.tanh(W_hh @ h + b_h)
+                h = no_input_hidden_step(h, W_hh, b_h, use_relu=use_relu)
                 z = (h - mean) @ components.T
                 zs.append(z)
             zs = np.asarray(zs, dtype=float)
@@ -1726,18 +1785,22 @@ def plot_space_to_space_trajectories(
         if seed_char not in char_to_index:
             seed_char = chars[0]
 
-        h = np.zeros(hidden_states.shape[1], dtype=float)
+        h = np.zeros((hidden_states.shape[1], 1), dtype=float)
         generated = [seed_char]
         gen_h = []
+        use_relu = bool(model.get("use_relu", False))
+        b_h_col = np.asarray(model["bias_hidden"])
 
         prev_char = seed_char
         for _ in range(int(closed_loop_steps)):
-            x = np.zeros((vocab_size,), dtype=float)
-            x[char_to_index[prev_char]] = 1.0
-            h = np.tanh(W_xh @ x + W_hh @ h + b_h)
-            gen_h.append(h.copy())
+            x = np.zeros((vocab_size, 1), dtype=float)
+            x[char_to_index[prev_char], 0] = 1.0
+            h, _ = rnn_hidden_step(
+                h, x, W_xh, W_hh, b_h_col, use_relu=use_relu,
+            )
+            gen_h.append(h.ravel().copy())
 
-            logits = W_ho @ h + b_o
+            logits = W_ho @ h.ravel() + b_o
             logits = logits - np.max(logits)
             probs = np.exp(logits)
             probs = probs / np.sum(probs)
@@ -1871,10 +1934,10 @@ def plot_pca_vector_field(
     # z -> h (2D PCA reconstruction)
     h = reconstruct_from_pca(z_grid, mean, components)
 
-    # No-input recurrent step: h' = tanh(Whh h + b)
     W_hh = np.asarray(model["weights_hidden_to_hidden"])
-    b_h = np.asarray(model["bias_hidden"]).ravel()
-    h_next = np.tanh(h @ W_hh.T + b_h)
+    b_h = np.asarray(model["bias_hidden"])
+    use_relu = bool(model.get("use_relu", False))
+    h_next = no_input_hidden_step(h, W_hh, b_h, use_relu=use_relu)
 
     # h' -> z' via the same PCA projection
     z_next = (h_next - mean) @ components.T
@@ -2188,47 +2251,97 @@ def symmetric_abs_vmax(*matrices):
     return float(max(np.max(np.abs(m)) for m in matrices))
 
 
-def plot_learned_weights(model, out_dir):
-    """Side-by-side Wxh and Whh heatmaps; hidden units in index order h0..h{n-1}."""
+def hidden_unit_labels(dale_sign, hidden_size: int) -> list[str]:
+    if dale_sign is None or len(dale_sign) != hidden_size:
+        return [f"h{i}" for i in range(hidden_size)]
+    return [f"h{i}({'E' if s > 0 else 'I'})" for i, s in enumerate(dale_sign)]
+
+
+def ei_block_boundary(dale_sign) -> int | None:
+    """Index between E and I blocks (line drawn between n_E-1 and n_E)."""
+    if dale_sign is None:
+        return None
+    n_exc = int(np.sum(np.asarray(dale_sign) > 0))
+    if 0 < n_exc < len(dale_sign):
+        return n_exc
+    return None
+
+
+def weights_for_plot(model: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, object]:
+    """Return W_xh, W_hh, W_ho (and dale_sign) in E-first / I-last order."""
+    from rnn_dyn import dale_signs_ordered, permute_hidden_by_dale
+
     W_in = np.asarray(model["weights_input_to_hidden"])
     W_rec = np.asarray(model["weights_hidden_to_hidden"])
+    W_out = np.asarray(model["weights_hidden_to_output"])
+    b_h = np.asarray(model["bias_hidden"])
+    dale_sign = model.get("dale_sign")
+    if dale_sign is not None and len(dale_sign) == W_in.shape[0]:
+        dale_sign = np.asarray(dale_sign, dtype=float)
+        if not dale_signs_ordered(dale_sign):
+            W_in, W_rec, W_out, b_h, dale_sign = permute_hidden_by_dale(
+                W_in, W_rec, W_out, b_h, dale_sign,
+            )
+    return W_in, W_rec, W_out, dale_sign
+
+
+def _draw_ei_guides(ax, boundary: int | None, *, horizontal: bool, vertical: bool) -> None:
+    if boundary is None:
+        return
+    if horizontal:
+        ax.axhline(boundary - 0.5, color="black", lw=1.0, ls="--")
+    if vertical:
+        ax.axvline(boundary - 0.5, color="black", lw=1.0, ls="--")
+
+
+def plot_learned_weights(model, out_dir):
+    """Input (W_xh) and hidden recurrent (W_hh); E columns red, I blue, 0 white."""
+    W_in, W_rec, _W_out, dale_sign = weights_for_plot(model)
     chars = model["chars"]
     hidden_size, vocab_size = W_in.shape
-    vmax = symmetric_abs_vmax(W_in, W_rec)
-    unit_labels = [f"h{i}" for i in range(hidden_size)]
+    unit_labels = hidden_unit_labels(dale_sign, hidden_size)
+    boundary = ei_block_boundary(dale_sign)
+
+    # Hidden units are columns: E block (red) then I block (blue).
+    W_input = W_in.T
+    W_hidden = W_rec
+    vmax = max(symmetric_abs_vmax(W_input, W_hidden), 1e-9)
 
     fig, axes = plt.subplots(
         1, 2,
-        figsize=(max(8, vocab_size * 0.5 + hidden_size * 0.5), max(3.5, hidden_size * 0.55)),
+        figsize=(max(8, vocab_size * 0.5 + hidden_size * 0.45), max(3.5, hidden_size * 0.55)),
         constrained_layout=True,
     )
+    cmap = plt.cm.RdBu_r
 
-    axes[0].imshow(
-        W_in, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+    im0 = axes[0].imshow(
+        W_input, aspect="auto", cmap=cmap, vmin=-vmax, vmax=vmax,
         interpolation="nearest", origin="lower",
     )
-    axes[0].set_xticks(range(vocab_size))
-    axes[0].set_xticklabels(char_axis_labels(chars), fontsize=8)
-    axes[0].set_yticks(range(hidden_size))
-    axes[0].set_yticklabels(unit_labels)
-    axes[0].set_xlabel("input character")
-    axes[0].set_ylabel("hidden unit")
-    axes[0].set_title("Input → hidden (Wxh)")
+    axes[0].set_title("Input")
+    axes[0].set_xlabel("hidden unit (E | I)")
+    axes[0].set_ylabel("input character")
+    axes[0].set_xticks(range(hidden_size))
+    axes[0].set_xticklabels(unit_labels, fontsize=6, rotation=90)
+    axes[0].set_yticks(range(vocab_size))
+    axes[0].set_yticklabels(char_axis_labels(chars), fontsize=8)
+    _draw_ei_guides(axes[0], boundary, horizontal=False, vertical=True)
 
     im1 = axes[1].imshow(
-        W_rec, aspect="equal", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+        W_hidden, aspect="equal", cmap=cmap, vmin=-vmax, vmax=vmax,
         interpolation="nearest", origin="lower",
     )
+    axes[1].set_title("Hidden")
+    axes[1].set_xlabel("source h (E | I)")
+    axes[1].set_ylabel("target h (E | I)")
     axes[1].set_xticks(range(hidden_size))
-    axes[1].set_xticklabels(unit_labels, fontsize=7, rotation=90)
+    axes[1].set_xticklabels(unit_labels, fontsize=6, rotation=90)
     axes[1].set_yticks(range(hidden_size))
-    axes[1].set_yticklabels(unit_labels)
-    axes[1].set_xlabel("source h (t−1)")
-    axes[1].set_ylabel("target h (t)")
-    axes[1].set_title("Hidden → hidden (Whh)")
+    axes[1].set_yticklabels(unit_labels, fontsize=6)
+    _draw_ei_guides(axes[1], boundary, horizontal=True, vertical=True)
 
-    fig.colorbar(im1, ax=axes, fraction=0.03, pad=0.02, label="weight")
-    fig.suptitle("Learned weights (final model)", y=1.02)
+    fig.colorbar(im1, ax=axes, fraction=0.03, pad=0.02, label="weight (E red, I blue)")
+    fig.suptitle("Learned weights", y=1.02)
     save_path = os.path.join(out_dir, "weights.png")
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -2253,15 +2366,203 @@ def _mean_out_per_unit(W_rec: np.ndarray, W_out: np.ndarray) -> np.ndarray:
     ])
 
 
+def _extract_ei_block(
+    W_in: np.ndarray,
+    W_hh: np.ndarray,
+    *,
+    dale_sign: np.ndarray,
+    layer: str,
+    post: str,
+    pre: str,
+    vocab_size: int,
+) -> np.ndarray:
+    """Flatten one E/I submatrix (target row E/I × source E/I)."""
+    from rnn_dyn import dale_ei_blocks
+
+    exc, inh = dale_ei_blocks(dale_sign)
+    post_idx = exc if post == "E" else inh
+    pre_idx = exc if pre == "E" else inh
+    if layer == "xh":
+        # Input has no E/I; map pre E/I to first/second half of character alphabet.
+        mid = max(vocab_size // 2, 1)
+        cols = np.arange(0, mid) if pre == "E" else np.arange(mid, vocab_size)
+        if len(post_idx) == 0 or len(cols) == 0:
+            return np.array([])
+        return W_in[np.ix_(post_idx, cols)].ravel()
+    if len(post_idx) == 0 or len(pre_idx) == 0:
+        return np.array([])
+    return W_hh[np.ix_(post_idx, pre_idx)].ravel()
+
+
+def _collect_block_weights(
+    snaps: np.ndarray,
+    *,
+    hidden_size: int,
+    vocab_size: int,
+    dale_sign: np.ndarray,
+    layer: str,
+    post: str,
+    pre: str,
+) -> np.ndarray:
+    """Weight trajectories for one block; shape (n_snap, n_syn), sorted by |w| range."""
+    from rnn_dyn import unpack_weight_snapshot
+
+    rows = []
+    for vec in snaps:
+        W_in, W_hh, _ = unpack_weight_snapshot(vec, hidden_size, vocab_size)
+        block = _extract_ei_block(
+            W_in, W_hh, dale_sign=dale_sign, layer=layer, post=post, pre=pre,
+            vocab_size=vocab_size,
+        )
+        rows.append(block)
+
+    max_len = max((s.size for s in rows), default=0)
+    if max_len == 0:
+        return np.zeros((len(rows), 0))
+    out = np.full((len(rows), max_len), np.nan)
+    for t, s in enumerate(rows):
+        out[t, : s.size] = s
+    spread = np.nanmax(out, axis=0) - np.nanmin(out, axis=0)
+    order = np.argsort(spread)[::-1]
+    return out[:, order]
+
+
+def _panel_vmax(data: np.ndarray, pct: float = 99.0) -> float:
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return 1e-3
+    return max(float(np.percentile(np.abs(finite), pct)), 1e-4)
+
+
+def _plot_ei_block_panel(ax, data, iters, title: str) -> object | None:
+    if data.size == 0 or data.shape[1] == 0:
+        ax.text(0.5, 0.5, "no synapses", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return None
+    vmax = _panel_vmax(data)
+    im = ax.imshow(
+        data.T,
+        aspect="auto",
+        cmap=plt.cm.RdBu_r,
+        vmin=-vmax,
+        vmax=vmax,
+        interpolation="nearest",
+        origin="lower",
+    )
+    ax.set_title(f"{title}\n(n={data.shape[1]} syns)", fontsize=9)
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("synapse (sorted by |w| range)")
+    if len(iters) > 0:
+        tick_idx = np.linspace(0, len(iters) - 1, min(6, len(iters)), dtype=int)
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels([str(iters[i]) for i in tick_idx], fontsize=7)
+    return im
+
+
+def plot_weight_dynamics_over_training(model, save_path: str) -> None:
+    """Eight weight heatmaps over training: 4× W_xh + 4× W_hh (EE/EI/IE/II)."""
+    if "weight_snap_outgoing" not in model:
+        print(f"skip {save_path}: re-run min-char-rnn.py to record weight snapshots")
+        return
+
+    snaps = np.asarray(model["weight_snap_outgoing"], dtype=float)
+    iters = np.asarray(model["weight_snap_iterations"], dtype=int)
+    if snaps.ndim != 2 or snaps.shape[0] < 2:
+        print(f"skip {save_path}: insufficient weight snapshot history")
+        return
+
+    dale_sign = model.get("dale_sign")
+    if dale_sign is None or len(dale_sign) != int(model["hidden_size"]):
+        print(f"skip {save_path}: Dale sign vector required for E/I blocks")
+        return
+
+    from rnn_dyn import snapshot_vector_layout
+
+    hidden_size = int(model["hidden_size"])
+    vocab_size = int(model["vocab_size"])
+    layout = snapshot_vector_layout(hidden_size, vocab_size, snaps.shape[1])
+    if layout == "outgoing":
+        print(
+            f"skip {save_path}: re-run training for full snapshots "
+            "(need W_xh + W_hh in weight_snap_outgoing)",
+        )
+        return
+
+    viol = np.asarray(model.get("weight_snap_violation_frac", []), dtype=float)
+    dale_sign = np.asarray(dale_sign, dtype=float)
+
+    xh_blocks = [("E", "E"), ("E", "I"), ("I", "E"), ("I", "I")]
+    hh_blocks = [("E", "E"), ("E", "I"), ("I", "E"), ("I", "I")]
+    # post = target row; pre = source (vocab half for xh, hidden unit for hh).
+    xh_titles = [r"$W_{xh}$ EE", r"$W_{xh}$ EI", r"$W_{xh}$ IE", r"$W_{xh}$ II"]
+    hh_titles = [r"$W_{hh}$ EE", r"$W_{hh}$ EI", r"$W_{hh}$ IE", r"$W_{hh}$ II"]
+
+    block_data = []
+    for post, pre in xh_blocks:
+        block_data.append(
+            _collect_block_weights(
+                snaps,
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                dale_sign=dale_sign,
+                layer="xh",
+                post=post,
+                pre=pre,
+            )
+        )
+    for post, pre in hh_blocks:
+        block_data.append(
+            _collect_block_weights(
+                snaps,
+                hidden_size=hidden_size,
+                vocab_size=vocab_size,
+                dale_sign=dale_sign,
+                layer="hh",
+                post=post,
+                pre=pre,
+            )
+        )
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9), constrained_layout=True)
+    fig.suptitle(
+        r"Weight per synapse over training (per-panel scale; E red, I blue) — "
+        r"$W_{xh}$: E/I row $\times$ input half; $W_{hh}$: E/I row $\times$ E/I column",
+        fontsize=10,
+        y=1.02,
+    )
+
+    ims = []
+    for ax, data, title in zip(axes[0], block_data[:4], xh_titles):
+        im = _plot_ei_block_panel(ax, data, iters, title)
+        if im is not None:
+            ims.append(im)
+    for ax, data, title in zip(axes[1], block_data[4:], hh_titles):
+        im = _plot_ei_block_panel(ax, data, iters, title)
+        if im is not None:
+            ims.append(im)
+
+    if ims:
+        fig.colorbar(
+            ims[-1], ax=axes.ravel().tolist(), fraction=0.02, pad=0.02,
+            label="weight (E red, I blue; scale varies per panel)",
+        )
+
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
 def plot_weight_eigenspectra(model, save_path: str) -> None:
     """Spectra, pooled weight histogram, and per-unit mean |in| / |out|."""
-    W_in = np.asarray(model["weights_input_to_hidden"])
-    W_rec = np.asarray(model["weights_hidden_to_hidden"])
-    W_out = np.asarray(model["weights_hidden_to_output"])
+    W_in, W_rec, W_out, dale_sign = weights_for_plot(model)
     b_h = np.asarray(model["bias_hidden"]).ravel()
+    if dale_sign is not None and len(dale_sign) == W_in.shape[0]:
+        from rnn_dyn import dale_signs_ordered, permute_hidden_by_dale
+        if not dale_signs_ordered(dale_sign):
+            _, _, _, b_h, _ = permute_hidden_by_dale(W_in, W_rec, W_out, b_h, dale_sign)
     b_o = np.asarray(model["bias_output"]).ravel()
     hidden_size = W_in.shape[0]
-    unit_labels = [f"h{i}" for i in range(hidden_size)]
+    unit_labels = hidden_unit_labels(dale_sign, hidden_size)
 
     fig, axes = plt.subplots(2, 3, figsize=(13, 7.5), constrained_layout=True)
 
@@ -2427,6 +2728,9 @@ def main() -> None:
     plot_weight_eigenspectra(
         model, save_path=os.path.join(out_dir, "weights_eigenspectra.png")
     )
+    plot_weight_dynamics_over_training(
+        model, os.path.join(out_dir, "weight_dynamics_over_training.png")
+    )
     plot_learning_curve(
         model,
         save_path=os.path.join(out_dir, "learning_curve.png"),
@@ -2454,10 +2758,12 @@ def main() -> None:
 
     hidden_states, output_probs = forward_pass(model, text)
     targets = list(text[1:]) + [text[0]]
+    act_label = activation_label(use_relu=bool(model.get("use_relu", False)))
 
     plot_hidden_states_heatmap(
         text, hidden_states,
         save_path=os.path.join(out_dir, "activation_heatmap.png"),
+        act_label=act_label,
     )
 
     plot_output_probs(

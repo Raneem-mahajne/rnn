@@ -8,14 +8,30 @@ REPO_ROOT = Path(__file__).resolve().parent
 EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
 
 # Per-regime defaults for corpus size, training, and visualization window.
-_BASE_CONFIG: dict[str, dict[str, int]] = {
+_BASE_CONFIG: dict[str, dict] = {
     "ten_word_overlap": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
     "twelve_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
     "sixteen_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
-    # Train longer + bigger model: 4-letter words have more structure to memorize.
-    "ten_four_letter_overlap": {"chars": 50_000, "steps": 20_000, "viz_length": 150, "hidden_size": 10},
     "six_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
     "six_word_overlap_sin": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
+    # 4-letter vocab; Dale + ReLU, soft sign constraint, larger hidden layer.
+    "ten_four_letter_overlap": {
+        "chars": 50_000,
+        "steps": 15_000,
+        "viz_length": 150,
+        "hidden_size": 32,
+        "sequence_length": 40,
+    },
+    "ten_four_letter_overlap_dale": {
+        "regime": "ten_four_letter_overlap",
+        "chars": 50_000,
+        "steps": 15_000,
+        "viz_length": 150,
+        "hidden_size": 64,
+        "dale": True,
+        "e_fraction": 0.8,
+        "sequence_length": 40,
+    },
 }
 
 
@@ -24,15 +40,25 @@ def spaced_experiment_name(regime: str) -> str:
     return f"{regime}_s"
 
 
+def experiment_folder_name(regime: str, *, word_space: bool, dale: bool) -> str:
+    """Folder name encodes spacing; '_dale' suffix when Dale's law is on."""
+    name = spaced_experiment_name(regime) if word_space else regime
+    return f"{name}_dale" if dale else name
+
+
 def _build_experiment_config() -> dict[str, dict]:
     configs: dict[str, dict] = {}
     for regime, cfg in _BASE_CONFIG.items():
-        configs[regime] = {**cfg, "regime": regime, "word_space": False}
-        configs[spaced_experiment_name(regime)] = {
-            **cfg,
-            "regime": regime,
-            "word_space": True,
-        }
+        task_regime = cfg.get("regime", regime)
+        dale = bool(cfg.get("dale", False))
+        for word_space in (False, True):
+            exp_name = experiment_folder_name(task_regime, word_space=word_space, dale=dale)
+            configs[exp_name] = {
+                **cfg,
+                "regime": task_regime,
+                "word_space": word_space,
+                "dale": dale,
+            }
     return configs
 
 
@@ -48,9 +74,12 @@ def experiment_regime(name: str) -> str:
     cfg = EXPERIMENT_CONFIG.get(name)
     if cfg and "regime" in cfg:
         return cfg["regime"]
-    if name.endswith("_s"):
-        return name[:-2]
-    return name
+    base = name
+    if base.endswith("_dale"):
+        base = base[: -len("_dale")]
+    if base.endswith("_s"):
+        base = base[:-2]
+    return base
 
 
 def experiment_dir(name: str) -> Path:

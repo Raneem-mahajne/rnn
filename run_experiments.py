@@ -56,6 +56,11 @@ def main() -> None:
             ]
             if "hidden_size" in cfg:
                 train_cmd.extend(["--hidden-size", str(cfg["hidden_size"])])
+            if cfg.get("dale"):
+                train_cmd.append("--dale")
+                train_cmd.extend(["--e-fraction", str(cfg.get("e_fraction", 0.8))])
+            if "sequence_length" in cfg:
+                train_cmd.extend(["--sequence-length", str(cfg["sequence_length"])])
             run(train_cmd)
 
         run([

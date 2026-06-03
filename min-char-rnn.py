@@ -19,9 +19,24 @@ Recurrence (forward):
   loss_at_t        = -log(output_probs[t][target_index])
 """
 import argparse
+import copy
 import os
 
 import numpy as np
+
+from rnn_dyn import (
+    activation_label,
+    adagrad_step,
+    flatten_weight_snapshot,
+    hidden_activation,
+    hidden_activation_backward,
+    dale_violation_fraction,
+    init_dale_weights,
+    recurrent_pre_activation,
+    rnn_hidden_step,
+    sample_dale_signs,
+    stable_softmax,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--steps', type=int, default=2000,
@@ -32,6 +47,12 @@ parser.add_argument('--model', default='model.npz',
                     help='where to save trained weights (default: model.npz)')
 parser.add_argument('--hidden-size', type=int, default=2,
                     help='number of recurrent units (default: 2)')
+parser.add_argument('--dale', action='store_true',
+                    help="enforce Dale's law on outgoing synapses (+/- per neuron)")
+parser.add_argument('--e-fraction', type=float, default=0.8,
+                    help='fraction of excitatory neurons when --dale (default: 0.8)')
+parser.add_argument('--sequence-length', type=int, default=25,
+                    help='BPTT window length in characters (default: 25)')
 args = parser.parse_args()
 
 # ----- data I/O ---------------------------------------------------------------
@@ -47,17 +68,35 @@ vocab_words = set(text.split()) if (" " in text) else set()
 
 # ----- hyperparameters --------------------------------------------------------
 hidden_size = args.hidden_size  # number of recurrent units in the hidden layer
-sequence_length = 25       # backprop-through-time window: longer = more context but slower / harder to train
-learning_rate = 1e-1       # Adagrad base step size
+sequence_length = max(1, int(args.sequence_length))
+dale_law = bool(args.dale)
+learning_rate = 2.5e-2 if dale_law else 1e-1  # Dale/ReLU: gentler than tanh, not too slow
+use_relu = dale_law        # Dale's law: nonnegative activity, fixed outgoing sign
+e_fraction = float(args.e_fraction)
+init_rng = np.random.default_rng(0)
 
 # ----- model parameters -------------------------------------------------------
-# Small random init breaks symmetry; biases start at 0.
-# Shapes are chosen so the matrix multiplies in the forward pass type-check.
-weights_input_to_hidden  = np.random.randn(hidden_size, vocab_size)  * 0.01  # shape (hidden_size, vocab_size)
-weights_hidden_to_hidden = np.random.randn(hidden_size, hidden_size) * 0.01  # shape (hidden_size, hidden_size); all-to-all recurrent connectivity
-weights_hidden_to_output = np.random.randn(vocab_size, hidden_size)  * 0.01  # shape (vocab_size, hidden_size); read-out into per-char logits
-bias_hidden = np.zeros((hidden_size, 1))                                      # shape (hidden_size, 1)
-bias_output = np.zeros((vocab_size, 1))                                       # shape (vocab_size, 1)
+dale_sign = None
+if dale_law:
+    dale_sign = sample_dale_signs(hidden_size, e_fraction, init_rng)
+    (weights_input_to_hidden,
+     weights_hidden_to_hidden,
+     weights_hidden_to_output) = init_dale_weights(
+        hidden_size, vocab_size, dale_sign, scale=0.005, rng=init_rng,
+    )
+    n_exc = int(np.sum(dale_sign > 0))
+    exc_range = f"h0..h{n_exc - 1}" if n_exc > 0 else "(none)"
+    inh_range = f"h{n_exc}..h{hidden_size - 1}" if n_exc < hidden_size else "(none)"
+    print(f"Dale's law: {n_exc} excitatory ({exc_range}), "
+          f"{hidden_size - n_exc} inhibitory ({inh_range}), "
+          f"E fraction {n_exc / hidden_size:.2f}, activation={activation_label(use_relu=use_relu)}")
+else:
+    weights_input_to_hidden = init_rng.standard_normal((hidden_size, vocab_size)) * 0.01
+    weights_hidden_to_hidden = init_rng.standard_normal((hidden_size, hidden_size)) * 0.01
+    weights_hidden_to_output = init_rng.standard_normal((vocab_size, hidden_size)) * 0.01
+
+bias_hidden = np.zeros((hidden_size, 1))
+bias_output = np.zeros((vocab_size, 1))
 
 
 def compute_loss_and_gradients(input_indices, target_indices, previous_hidden_state):
@@ -78,7 +117,7 @@ def compute_loss_and_gradients(input_indices, target_indices, previous_hidden_st
   """
   # Per-timestep caches kept around so we can reuse the activations during backprop.
   # Indexed by t (the time step within this window). hidden_states[-1] holds the carried-over state.
-  inputs_one_hot, hidden_states, output_logits, output_probs = {}, {}, {}, {}
+  inputs_one_hot, hidden_states, pre_activations, output_logits, output_probs = {}, {}, {}, {}, {}
   hidden_states[-1] = np.copy(previous_hidden_state)
   loss = 0
 
@@ -89,20 +128,20 @@ def compute_loss_and_gradients(input_indices, target_indices, previous_hidden_st
     inputs_one_hot[t] = np.zeros((vocab_size, 1))
     inputs_one_hot[t][input_indices[t]] = 1
 
-    # Recurrent update. tanh squashes to (-1, 1) so the state can't blow up in the forward direction.
-    hidden_states[t] = np.tanh(
-        np.dot(weights_input_to_hidden,  inputs_one_hot[t]) +    # contribution of the new input
-        np.dot(weights_hidden_to_hidden, hidden_states[t-1]) +   # contribution of the past (memory)
-        bias_hidden
+    pre_activations[t] = recurrent_pre_activation(
+        inputs_one_hot[t], hidden_states[t - 1],
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
     )
+    hidden_states[t] = hidden_activation(pre_activations[t], use_relu=use_relu)
 
     # Read out logits, then softmax to get a probability distribution over the vocab.
     output_logits[t] = np.dot(weights_hidden_to_output, hidden_states[t]) + bias_output
-    output_probs[t]  = np.exp(output_logits[t]) / np.sum(np.exp(output_logits[t]))
+    output_probs[t] = stable_softmax(output_logits[t]).reshape(-1, 1)
 
     # Cross-entropy: penalize the negative log-probability the model assigned to the correct next char.
     # If the model is surprised (prob of target is small), the loss is large; if prob ~ 1, loss ~ 0.
-    loss += -np.log(output_probs[t][target_indices[t], 0])
+    p = float(output_probs[t][target_indices[t], 0])
+    loss += -np.log(max(p, 1e-12))
 
   # ----- backward pass: BPTT, t = sequence_length - 1, ..., 0 -----------------
   # We need d(loss)/d(param) for every learnable parameter. Each parameter is shared
@@ -143,10 +182,10 @@ def compute_loss_and_gradients(input_indices, target_indices, previous_hidden_st
     # Sum both -> the *total* gradient flowing back into hidden_states[t].
     grad_hidden = np.dot(weights_hidden_to_output.T, grad_output) + grad_hidden_next
 
-    # ---- (4) backprop through the tanh nonlinearity ------------------------
-    # hidden_states[t] = tanh(pre_activation),  tanh'(z) = 1 - tanh(z)^2 = 1 - hidden_states[t]^2.
-    # So  d(loss)/d(pre_activation) = (1 - hidden_states[t]^2) * grad_hidden   (elementwise).
-    grad_hidden_raw = (1 - hidden_states[t] * hidden_states[t]) * grad_hidden
+    # ---- (4) backprop through the hidden nonlinearity ----------------------
+    grad_hidden_raw = hidden_activation_backward(
+        grad_hidden, pre_activations[t], hidden_states[t], use_relu=use_relu,
+    )
 
     # ---- (5) push that into the pre-activation parameters ------------------
     # pre_activation = weights_input_to_hidden  @ inputs_one_hot[t]
@@ -180,33 +219,29 @@ def compute_loss_and_gradients(input_indices, target_indices, previous_hidden_st
           hidden_states[len(input_indices) - 1])
 
 
-def sample(hidden_state, seed_index, num_chars_to_sample):
+def sample(
+    hidden_state,
+    seed_index,
+    num_chars_to_sample,
+    *,
+    rng: np.random.Generator | None = None,
+):
   """
-  Generate characters from the model, one at a time, by repeatedly:
-    feed in current char -> compute next-char distribution -> draw a sample -> use it as the next input.
-
-  hidden_state:         ndarray (hidden_size, 1) initial memory
-                        (typically the most recent state from training).
-  seed_index:           int, id of the very first input char used to "prime" the model.
-  num_chars_to_sample:  how many chars to emit.
+  Stochastic generation: draw each next char from the model's softmax (never argmax).
   """
+  rng = rng or np.random.default_rng()
   input_one_hot = np.zeros((vocab_size, 1))
   input_one_hot[seed_index] = 1
   sampled_indices = []
-  for t in range(num_chars_to_sample):
-    # Identical recurrence to the forward pass in compute_loss_and_gradients.
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+  for _ in range(num_chars_to_sample):
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
-    probs = np.exp(logits) / np.sum(np.exp(logits))
-
-    # Sample a next-char index from the predicted distribution (stochastic, not argmax).
-    next_char_index = np.random.choice(range(vocab_size), p=probs.ravel())
-
-    # Feed the sampled char back in as the next input (one-hot it again).
+    probs = stable_softmax(logits)
+    next_char_index = int(rng.choice(range(vocab_size), p=probs.ravel()))
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[next_char_index] = 1
     sampled_indices.append(next_char_index)
@@ -219,13 +254,13 @@ def argmax_sample(hidden_state, seed_index, num_chars_to_sample):
   input_one_hot[seed_index] = 1
   sampled_indices = []
   for t in range(num_chars_to_sample):
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
-    probs = np.exp(logits) / np.sum(np.exp(logits))
+    probs = stable_softmax(logits)
     next_char_index = int(np.argmax(probs))
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[next_char_index] = 1
@@ -248,10 +283,10 @@ def argmax_sample_with_prompt(prompt_text: str, num_chars_to_sample: int):
 
   # Consume prompt with teacher forcing.
   for ch_next in prompt_text[1:]:
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     # Advance input to the true next prompt char.
     input_one_hot = np.zeros((vocab_size, 1))
@@ -260,13 +295,13 @@ def argmax_sample_with_prompt(prompt_text: str, num_chars_to_sample: int):
   # Generate continuation.
   sampled_indices = []
   for _ in range(num_chars_to_sample):
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
-    probs = np.exp(logits) / np.sum(np.exp(logits))
+    probs = stable_softmax(logits)
     next_char_index = int(np.argmax(probs))
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[next_char_index] = 1
@@ -287,23 +322,23 @@ def sample_with_prompt(prompt_text: str, num_chars_to_sample: int, *, rng: np.ra
 
   # Consume prompt with teacher forcing.
   for ch_next in prompt_text[1:]:
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[char_to_index[ch_next]] = 1
 
   sampled_indices = []
   for _ in range(num_chars_to_sample):
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
-    probs = np.exp(logits) / np.sum(np.exp(logits))
+    probs = stable_softmax(logits)
     next_char_index = int(rng.choice(range(vocab_size), p=probs.ravel()))
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[next_char_index] = 1
@@ -320,18 +355,52 @@ def sample_from_seed_char(seed_char: str, num_chars_to_sample: int, *, rng: np.r
   input_one_hot[char_to_index[seed_char]] = 1
   sampled_indices = []
   for _ in range(num_chars_to_sample):
-    hidden_state = np.tanh(
-        np.dot(weights_input_to_hidden,  input_one_hot) +
-        np.dot(weights_hidden_to_hidden, hidden_state) +
-        bias_hidden
+    hidden_state, _ = rnn_hidden_step(
+        hidden_state, input_one_hot,
+        weights_input_to_hidden, weights_hidden_to_hidden, bias_hidden,
+        use_relu=use_relu,
     )
     logits = np.dot(weights_hidden_to_output, hidden_state) + bias_output
-    probs = np.exp(logits) / np.sum(np.exp(logits))
+    probs = stable_softmax(logits)
     next_char_index = int(rng.choice(range(vocab_size), p=probs.ravel()))
     input_one_hot = np.zeros((vocab_size, 1))
     input_one_hot[next_char_index] = 1
     sampled_indices.append(next_char_index)
   return sampled_indices
+
+
+def stochastic_word_validity_metrics(
+    seed_index: int,
+    vocab: set[str],
+    *,
+    rng: np.random.Generator,
+) -> tuple[float, float, str]:
+    """Mean invalid-word rate and in-vocab letter frac over several long rollouts."""
+    word_errs: list[float] = []
+    letter_fracs: list[float] = []
+    first_text = ""
+    for r in range(METRIC_NUM_ROLLOUTS):
+        h0 = np.zeros((hidden_size, 1))
+        indices = sample(h0, seed_index, METRIC_ROLLOUT_LEN, rng=rng)
+        text = "".join(index_to_char[i] for i in indices)
+        if r == 0:
+            first_text = text
+        word_errs.append(invalid_word_fraction(text, vocab))
+        letter_fracs.append(valid_vocab_letter_fraction(text, vocab))
+    word_err = float(np.nanmean(word_errs))
+    letter_frac = float(np.nanmean(letter_fracs))
+    return word_err, letter_frac, first_text
+
+
+def invalid_word_fraction(sampled_text: str, vocab: set[str]) -> float:
+    """Fraction of whitespace-delimited tokens not in the training vocabulary."""
+    if not vocab:
+        return float("nan")
+    tokens = [t for t in sampled_text.split(" ") if t]
+    if not tokens:
+        return float("nan")
+    bad = sum(1 for t in tokens if t not in vocab)
+    return bad / len(tokens)
 
 
 def valid_vocab_letter_fraction(sampled_text: str, vocab: set[str]) -> float:
@@ -373,6 +442,43 @@ loss_window = []
 # that land inside an in-vocabulary word in a short model rollout.
 metric_iters = []
 metric_valid_letter_frac = []
+metric_word_error_frac = []
+
+weight_snap_iters: list[int] = []
+weight_snap_outgoing: list[np.ndarray] = []
+weight_snap_violation_frac: list[float] = []
+WEIGHT_SNAP_EVERY = 100
+METRIC_ROLLOUT_LEN = 3_000
+METRIC_NUM_ROLLOUTS = 5
+METRIC_RNG_BASE = 42
+# Ignore early rollouts before real learning (checkpoint only on 0% invalid-word rate).
+MIN_CHECKPOINT_ITER = 8_000
+
+best_word_err = float("inf")
+best_valid_letter_frac = -1.0
+best_iter = -1
+best_state: dict[str, np.ndarray] | None = None
+zero_word_err_streak = 0
+
+
+def snapshot_params() -> dict[str, np.ndarray]:
+    return {
+        "weights_input_to_hidden": np.copy(weights_input_to_hidden),
+        "weights_hidden_to_hidden": np.copy(weights_hidden_to_hidden),
+        "weights_hidden_to_output": np.copy(weights_hidden_to_output),
+        "bias_hidden": np.copy(bias_hidden),
+        "bias_output": np.copy(bias_output),
+    }
+
+
+def restore_params(state: dict[str, np.ndarray]) -> None:
+    global weights_input_to_hidden, weights_hidden_to_hidden, weights_hidden_to_output
+    global bias_hidden, bias_output
+    weights_input_to_hidden = state["weights_input_to_hidden"]
+    weights_hidden_to_hidden = state["weights_hidden_to_hidden"]
+    weights_hidden_to_output = state["weights_hidden_to_output"]
+    bias_hidden = state["bias_hidden"]
+    bias_output = state["bias_output"]
 
 # Store a short "before vs after" deterministic sample for visualization.
 sample_before_text = None
@@ -410,14 +516,59 @@ while iteration < max_iterations:
     sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
     print('----\n %s \n----' % (sampled_text,))
 
-    # Deterministic rollout for a stable "word validity" metric.
-    det_indices = argmax_sample(previous_hidden_state, input_indices[0], 200)
-    det_text = ''.join(index_to_char[i] for i in det_indices)
+    metric_seed = char_to_index[demo_seed_char]
+    metric_rng = np.random.default_rng(METRIC_RNG_BASE + iteration)
+    word_err, letter_frac, rollout_text = stochastic_word_validity_metrics(
+        metric_seed, vocab_words, rng=metric_rng,
+    )
     metric_iters.append(iteration)
-    metric_valid_letter_frac.append(valid_vocab_letter_fraction(det_text, vocab_words))
+    metric_valid_letter_frac.append(letter_frac)
+    metric_word_error_frac.append(word_err)
+
+    if (
+        iteration >= MIN_CHECKPOINT_ITER
+        and vocab_words
+        and np.isfinite(word_err)
+    ):
+        if word_err <= 1e-12:
+            best_word_err = 0.0
+            best_valid_letter_frac = letter_frac
+            best_iter = iteration
+            best_state = copy.deepcopy(snapshot_params())
+        if iteration >= MIN_CHECKPOINT_ITER and word_err <= 1e-12:
+            zero_word_err_streak += 1
+        else:
+            zero_word_err_streak = 0
+        if zero_word_err_streak >= 3:
+            print(
+                f"early stop at iter {iteration}: "
+                "0 invalid vocabulary words for 300 iterations",
+            )
+            break
+
+    if iteration % WEIGHT_SNAP_EVERY == 0:
+      weight_snap_iters.append(iteration)
+      weight_snap_outgoing.append(
+          flatten_weight_snapshot(
+              weights_input_to_hidden,
+              weights_hidden_to_hidden,
+              weights_hidden_to_output,
+          )
+      )
+      if dale_law:
+        weight_snap_violation_frac.append(
+            dale_violation_fraction(
+                weights_input_to_hidden,
+                weights_hidden_to_hidden,
+                weights_hidden_to_output,
+                dale_sign,
+            )
+        )
+      else:
+        weight_snap_violation_frac.append(0.0)
 
     if iteration == 0:
-      sample_before_text = det_text[:160]
+      sample_before_text = rollout_text[:160]
       # Demo: condition on a real training prompt, then generate a continuation.
       demo_rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
       demo_idx = sample_from_seed_char(
@@ -435,7 +586,8 @@ while iteration < max_iterations:
    previous_hidden_state) = compute_loss_and_gradients(input_indices, target_indices, previous_hidden_state)
 
   # Exponential moving average of the loss for smoother printing.
-  smooth_loss = smooth_loss * 0.999 + loss * 0.001
+  if np.isfinite(loss):
+    smooth_loss = smooth_loss * 0.995 + loss * 0.005
   loss_iterations.append(iteration)
   loss_smooth.append(smooth_loss)
   loss_window.append(loss)
@@ -443,15 +595,29 @@ while iteration < max_iterations:
     print('iter %d, loss: %f' % (iteration, smooth_loss))
 
   # ----- Adagrad parameter update --------------------------------------------
-  # Adagrad accumulates squared gradients in `mem` and divides the learning rate by sqrt(mem).
-  # Effect: coordinates that have had large/frequent gradients get smaller effective step sizes,
-  # and rarely-updated coordinates get larger ones. The +1e-8 avoids div-by-zero.
-  for param, grad, mem in zip(
-      [weights_input_to_hidden, weights_hidden_to_hidden, weights_hidden_to_output, bias_hidden, bias_output],
-      [grad_weights_input_to_hidden, grad_weights_hidden_to_hidden, grad_weights_hidden_to_output, grad_bias_hidden, grad_bias_output],
-      [mem_weights_input_to_hidden,  mem_weights_hidden_to_hidden,  mem_weights_hidden_to_output,  mem_bias_hidden,  mem_bias_output]):
-    mem += grad * grad
-    param += -learning_rate * grad / np.sqrt(mem + 1e-8)
+  effective_lr = learning_rate
+  if dale_law and iteration > 0:
+      effective_lr = learning_rate * (0.9998 ** (iteration / 100.0))
+  adagrad_step(
+      weights_input_to_hidden, grad_weights_input_to_hidden, mem_weights_input_to_hidden,
+      effective_lr,
+      dale_sign=dale_sign if dale_law else None,
+      dale_axis="row",
+  )
+  adagrad_step(
+      weights_hidden_to_hidden, grad_weights_hidden_to_hidden, mem_weights_hidden_to_hidden,
+      effective_lr,
+      dale_sign=dale_sign if dale_law else None,
+      dale_axis="col",
+  )
+  adagrad_step(
+      weights_hidden_to_output, grad_weights_hidden_to_output, mem_weights_hidden_to_output,
+      effective_lr,
+      dale_sign=dale_sign if dale_law else None,
+      dale_axis="col",
+  )
+  adagrad_step(bias_hidden, grad_bias_hidden, mem_bias_hidden, effective_lr)
+  adagrad_step(bias_output, grad_bias_output, mem_bias_output, effective_lr)
 
   data_pointer += sequence_length
   iteration    += 1
@@ -462,9 +628,21 @@ sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
 print('----\n %s \n----' % (sampled_text,))
 print('iter %d, loss: %f (done)' % (iteration, smooth_loss))
 
-det_indices = argmax_sample(previous_hidden_state, char_to_index[text[0]], 200)
-det_text = ''.join(index_to_char[i] for i in det_indices)
-sample_after_text = det_text[:160]
+if (
+    best_state is not None
+    and best_iter >= MIN_CHECKPOINT_ITER
+    and best_word_err <= 1e-12
+):
+    print(f"using checkpoint from iter {best_iter} (0% invalid vocabulary words)")
+    restore_params(best_state)
+else:
+    print("keeping final weights (no 0% invalid-word checkpoint was reached)")
+
+final_rng = np.random.default_rng(METRIC_RNG_BASE + iteration + 1)
+final_word_err, final_letter_valid, rollout_text = stochastic_word_validity_metrics(
+    char_to_index[demo_seed_char], vocab_words, rng=final_rng,
+)
+sample_after_text = rollout_text[:160]
 
 demo_idx = sample_from_seed_char(
     demo_seed_char,
@@ -472,6 +650,20 @@ demo_idx = sample_from_seed_char(
     rng=np.random.default_rng(demo_rng_seed),
 )
 demo_after = ''.join(index_to_char[i] for i in demo_idx)
+
+print(
+    f"final word error rate (mean over {METRIC_NUM_ROLLOUTS} rollouts × "
+    f"{METRIC_ROLLOUT_LEN} chars, stochastic): {100.0 * final_word_err:.2f}%",
+)
+print(f"final in-vocab letter fraction: {100.0 * final_letter_valid:.2f}%")
+if dale_law:
+    viol = dale_violation_fraction(
+        weights_input_to_hidden,
+        weights_hidden_to_hidden,
+        weights_hidden_to_output,
+        dale_sign,
+    )
+    print(f"final Dale violation fraction (all constrained synapses): {100.0 * viol:.4f}%")
 
 # Save trained parameters and vocab so we can inspect/visualize the model later.
 model_out = args.model
@@ -493,6 +685,12 @@ np.savez(
     loss_window=np.array(loss_window, dtype=np.float64),
     metric_iterations=np.array(metric_iters, dtype=np.int32),
     metric_valid_vocab_letter_frac=np.array(metric_valid_letter_frac, dtype=np.float64),
+    metric_word_error_frac=np.array(metric_word_error_frac, dtype=np.float64),
+    best_metric_iter=np.array(best_iter, dtype=np.int32),
+    best_metric_word_error_frac=np.array(best_word_err, dtype=np.float64),
+    weight_snap_iterations=np.array(weight_snap_iters, dtype=np.int32),
+    weight_snap_outgoing=np.array(weight_snap_outgoing, dtype=np.float64),
+    weight_snap_violation_frac=np.array(weight_snap_violation_frac, dtype=np.float64),
     vocab_words=np.array(sorted(vocab_words)),
     sample_before=np.array(sample_before_text if sample_before_text is not None else ""),
     sample_after=np.array(sample_after_text if sample_after_text is not None else ""),
@@ -502,5 +700,9 @@ np.savez(
     demo_after=np.array(demo_after if demo_after is not None else ""),
     demo_rng_seed=np.array(demo_rng_seed, dtype=np.int64),
     demo_seed_char=np.array(demo_seed_char),
+    dale_law=np.array(dale_law),
+    use_relu=np.array(use_relu),
+    e_fraction=np.array(e_fraction),
+    dale_sign=np.array(dale_sign if dale_sign is not None else []),
 )
 print(f'saved trained model to {model_out}')
