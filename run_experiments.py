@@ -48,12 +48,15 @@ def main() -> None:
                 "--chars", str(cfg["chars"]),
                 "--seed", str(args.seed),
             ])
-            run([
+            train_cmd = [
                 sys.executable, "min-char-rnn.py",
                 "--input", str(input_path(name)),
                 "--model", str(model_path(name)),
                 "--steps", str(cfg["steps"]),
-            ])
+            ]
+            if "hidden_size" in cfg:
+                train_cmd.extend(["--hidden-size", str(cfg["hidden_size"])])
+            run(train_cmd)
 
         run([
             sys.executable, "visualize.py",

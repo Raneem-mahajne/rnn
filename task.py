@@ -31,6 +31,17 @@ REGIMES: dict[str, list[str]] = {
         "met", "pet", "net",
         "ate", "eat", "tea",
     ],
+    # 10 real 4-letter words with overlapping prefixes/suffixes.
+    "ten_four_letter_overlap": [
+        # same suffix -ake
+        "bake", "cake", "lake", "make",
+        # same suffix -ank
+        "bank", "tank",
+        # same prefix can-
+        "cane", "cant",
+        # same suffix -ate
+        "late", "mate",
+    ],
     # 6 words: one -at suffix family + one co- prefix family.
     "six_word_overlap": [
         "cat", "hat", "mat",
