@@ -79,10 +79,12 @@ init_rng = np.random.default_rng(0)
 dale_sign = None
 if dale_law:
     dale_sign = sample_dale_signs(hidden_size, e_fraction, init_rng)
+    # Smaller hidden layers need slightly larger init to escape the uniform regime.
+    dale_init_scale = 0.01 if hidden_size <= 32 else 0.005
     (weights_input_to_hidden,
      weights_hidden_to_hidden,
      weights_hidden_to_output) = init_dale_weights(
-        hidden_size, vocab_size, dale_sign, scale=0.005, rng=init_rng,
+        hidden_size, vocab_size, dale_sign, scale=dale_init_scale, rng=init_rng,
     )
     n_exc = int(np.sum(dale_sign > 0))
     exc_range = f"h0..h{n_exc - 1}" if n_exc > 0 else "(none)"
@@ -486,14 +488,19 @@ sample_after_text = None
 
 # Store a fixed "training snippet vs generated snippet" demo.
 prompt_len = 40
-cont_len = 100
+cont_len = 500
+DEMO_DISPLAY_LEN = 500
 demo_total = prompt_len + cont_len
 max_start = max(0, len(text) - demo_total - 1)
 demo_start = int(np.random.default_rng().integers(0, max_start + 1)) if max_start > 0 else 0
+if demo_start > 0:
+    prev_space = text.rfind(" ", 0, demo_start)
+    demo_start = prev_space + 1 if prev_space >= 0 else 0
 demo_prompt = text[demo_start:demo_start + prompt_len]
 demo_target = text[demo_start + prompt_len:demo_start + demo_total]
 demo_before = None
 demo_after = None
+demo_word_error_frac = float("nan")
 demo_rng_seed = 0
 demo_seed_char = " " if (" " in char_to_index) else text[0]
 
@@ -568,15 +575,9 @@ while iteration < max_iterations:
         weight_snap_violation_frac.append(0.0)
 
     if iteration == 0:
-      sample_before_text = rollout_text[:160]
-      # Demo: condition on a real training prompt, then generate a continuation.
-      demo_rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
-      demo_idx = sample_from_seed_char(
-          demo_seed_char,
-          cont_len,
-          rng=np.random.default_rng(demo_rng_seed),
-      )
-      demo_before = ''.join(index_to_char[i] for i in demo_idx)
+      sample_before_text = rollout_text[:DEMO_DISPLAY_LEN]
+      demo_rng_seed = METRIC_RNG_BASE
+      demo_before = rollout_text[:DEMO_DISPLAY_LEN]
 
   # Forward + backward over the window. previous_hidden_state is updated to the last
   # hidden state of *this* window, so the next iteration continues the recurrence smoothly.
@@ -638,22 +639,22 @@ if (
 else:
     print("keeping final weights (no 0% invalid-word checkpoint was reached)")
 
-final_rng = np.random.default_rng(METRIC_RNG_BASE + iteration + 1)
+final_rng = np.random.default_rng(METRIC_RNG_BASE + iteration)
 final_word_err, final_letter_valid, rollout_text = stochastic_word_validity_metrics(
     char_to_index[demo_seed_char], vocab_words, rng=final_rng,
 )
-sample_after_text = rollout_text[:160]
-
-demo_idx = sample_from_seed_char(
-    demo_seed_char,
-    cont_len,
-    rng=np.random.default_rng(demo_rng_seed),
-)
-demo_after = ''.join(index_to_char[i] for i in demo_idx)
+sample_after_text = rollout_text[:DEMO_DISPLAY_LEN]
+demo_rng_seed = METRIC_RNG_BASE + iteration
+demo_after = rollout_text[:DEMO_DISPLAY_LEN]
+demo_word_error_frac = invalid_word_fraction(rollout_text, vocab_words)
 
 print(
     f"final word error rate (mean over {METRIC_NUM_ROLLOUTS} rollouts × "
     f"{METRIC_ROLLOUT_LEN} chars, stochastic): {100.0 * final_word_err:.2f}%",
+)
+print(
+    f"final demo rollout ({len(rollout_text)} chars, seed {demo_rng_seed}): "
+    f"{100.0 * demo_word_error_frac:.2f}% invalid words",
 )
 print(f"final in-vocab letter fraction: {100.0 * final_letter_valid:.2f}%")
 if dale_law:
@@ -698,6 +699,7 @@ np.savez(
     demo_target=np.array(demo_target if demo_target is not None else ""),
     demo_before=np.array(demo_before if demo_before is not None else ""),
     demo_after=np.array(demo_after if demo_after is not None else ""),
+    demo_word_error_frac=np.array(demo_word_error_frac, dtype=np.float64),
     demo_rng_seed=np.array(demo_rng_seed, dtype=np.int64),
     demo_seed_char=np.array(demo_seed_char),
     dale_law=np.array(dale_law),

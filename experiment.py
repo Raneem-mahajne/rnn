@@ -9,12 +9,24 @@ EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
 
 # Per-regime defaults for corpus size, training, and visualization window.
 _BASE_CONFIG: dict[str, dict] = {
-    "ten_word_overlap": {"chars": 50_000, "steps": 15_000, "viz_length": 100},
+    "ten_word_overlap": {
+        "chars": 50_000,
+        "steps": 15_000,
+        "viz_length": 150,
+        "hidden_size": 32,
+        "sequence_length": 40,
+    },
     "twelve_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
-    "sixteen_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
+    "sixteen_word_overlap": {
+        "chars": 50_000,
+        "steps": 15_000,
+        "viz_length": 150,
+        "hidden_size": 32,
+        "sequence_length": 40,
+    },
     "six_word_overlap": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
     "six_word_overlap_sin": {"chars": 50_000, "steps": 1_500, "viz_length": 150},
-    # 4-letter vocab; Dale + ReLU, soft sign constraint, larger hidden layer.
+    # 4-letter vocab; Dale + ReLU, soft sign constraint.
     "ten_four_letter_overlap": {
         "chars": 50_000,
         "steps": 15_000,
@@ -27,7 +39,7 @@ _BASE_CONFIG: dict[str, dict] = {
         "chars": 50_000,
         "steps": 15_000,
         "viz_length": 150,
-        "hidden_size": 64,
+        "hidden_size": 50,
         "dale": True,
         "e_fraction": 0.8,
         "sequence_length": 40,

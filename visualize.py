@@ -41,6 +41,9 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
        Timestep × timestep Pearson correlation of hidden states, hierarchically
        clustered; row/column labels = prefix since last space; tick colors = min DFA state.
 
+  10b) state_correlation_by_dfa_state.png
+       Timesteps grouped by min DFA state; Pearson r within and between state blocks.
+
   11) dfa_state_distance_comparison.png
        Pairwise Euclidean distances between hidden states; bars = within vs between
        minimized DFA state (all timestep pairs in the test window).
@@ -125,6 +128,8 @@ def load_model(path: str = "model.npz"):
         model["demo_before"] = str(data["demo_before"])
     if "demo_after" in data.files:
         model["demo_after"] = str(data["demo_after"])
+    if "demo_word_error_frac" in data.files:
+        model["demo_word_error_frac"] = float(data["demo_word_error_frac"])
     if "demo_rng_seed" in data.files:
         model["demo_rng_seed"] = int(data["demo_rng_seed"])
     if "demo_seed_char" in data.files:
@@ -578,6 +583,104 @@ def plot_hidden_states_correlation_clustermap(
     print(f"wrote {save_path}")
 
 
+def _invalid_word_fraction(sampled_text: str, vocab: set[str]) -> float:
+    if not vocab:
+        return float("nan")
+    tokens = [t for t in sampled_text.split(" ") if t]
+    if not tokens:
+        return float("nan")
+    bad = sum(1 for t in tokens if t not in vocab)
+    return bad / len(tokens)
+
+
+def plot_dfa_grouped_state_correlation(
+    text: str,
+    hidden_states: np.ndarray,
+    save_path: str,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton,
+) -> None:
+    """Pearson r between hidden vectors; rows/cols grouped by min DFA state (all blocks)."""
+    n = hidden_states.shape[0]
+    if n < 2:
+        return
+
+    state_ids = [
+        dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+    ]
+    by_state: dict[int, list[int]] = {}
+    for t, sid in enumerate(state_ids):
+        by_state.setdefault(sid, []).append(t)
+
+    order: list[int] = []
+    boundaries: list[int] = [0]
+    block_labels: list[str] = []
+    for sid in sorted(by_state.keys()):
+        idxs = sorted(
+            by_state[sid],
+            key=lambda t: prefix_tick_label(text, t, spaced=spaced),
+        )
+        order.extend(idxs)
+        boundaries.append(len(order))
+        block_labels.append(dfa_state_label(sid, automaton))
+
+    if len(order) < 2:
+        print(f"skip {save_path}: need ≥2 timesteps")
+        return
+
+    corr = np.corrcoef(hidden_states[order])
+    np.fill_diagonal(corr, 1.0)
+    corr = np.nan_to_num(corr, nan=0.0)
+
+    state_colors = _state_id_colors(state_ids)
+
+    panel = max(9.0, len(order) * 0.14)
+    fig, ax = plt.subplots(figsize=(panel, panel * 0.92), constrained_layout=True)
+    im = ax.imshow(
+        corr,
+        aspect="equal",
+        cmap="RdBu_r",
+        vmin=-1,
+        vmax=1,
+        interpolation="nearest",
+        origin="lower",
+    )
+    block_sids = sorted(by_state.keys())
+    for b in boundaries[1:-1]:
+        ax.axhline(b - 0.5, color="black", lw=0.8)
+        ax.axvline(b - 0.5, color="black", lw=0.8)
+
+    tick_pos: list[float] = []
+    tick_labels: list[str] = []
+    for sid, lo, hi, lab in zip(block_sids, boundaries[:-1], boundaries[1:], block_labels):
+        tick_pos.append((lo + hi - 1) / 2.0)
+        tick_labels.append(f"q{sid}: {lab}")
+    tick_fs = max(5, min(8, 120 // max(len(tick_labels), 1)))
+
+    ax.set_xticks(tick_pos)
+    ax.set_yticks(tick_pos)
+    ax.set_xticklabels(tick_labels, fontsize=tick_fs, rotation=55, ha="right")
+    ax.set_yticklabels(tick_labels, fontsize=tick_fs)
+    for tick, sid in zip(ax.get_xticklabels(), block_sids):
+        tick.set_color(state_colors[sid])
+    for tick, sid in zip(ax.get_yticklabels(), block_sids):
+        tick.set_color(state_colors[sid])
+
+    ax.set_xlabel("min DFA state (accepted prefixes)")
+    ax.set_ylabel("min DFA state (accepted prefixes)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="Pearson r")
+    fig.suptitle(
+        "Hidden-state correlation grouped by min DFA state "
+        "(diagonal = within state, off-diagonal = vs other states)",
+        fontsize=10,
+        y=1.02,
+    )
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
 def pairwise_hidden_state_distance_groups(
     text: str,
     hidden_states: np.ndarray,
@@ -873,71 +976,101 @@ def _token_letter_valid_mask(text: str, vocab: set[str]) -> list[bool]:
     return mask
 
 
+SAMPLE_DISPLAY_WORDS = 15
+
+
+def _vocab_word_tokens(text: str, vocab: set[str], max_words: int) -> tuple[list[str], int]:
+    """Whitespace tokens that are whole in-vocabulary words."""
+    all_vocab = [t for t in text.split() if t in vocab]
+    return all_vocab[:max_words], len(all_vocab)
+
+
 def plot_sample_before_after(model, save_path: str) -> None:
-    """Show deterministic samples before/after training, colored by vocab validity."""
+    """Stochastic samples before/after training; first N words on one line."""
     if "sample_before" not in model or "sample_after" not in model:
         print(f"skip {save_path}: re-run min-char-rnn.py to record samples")
         return
 
-    before = str(model["sample_before"])
-    after = str(model["sample_after"])
     vocab = set(map(str, model.get("vocab_words", [])))
-
     demo_prompt = str(model.get("demo_prompt", ""))
     demo_target = str(model.get("demo_target", ""))
-    demo_before = str(model.get("demo_before", ""))
-    demo_after = str(model.get("demo_after", ""))
+    demo_before = str(model.get("demo_before", "")) or str(model["sample_before"])
+    demo_after = str(model.get("demo_after", "")) or str(model["sample_after"])
+    training_demo = (demo_prompt + demo_target).strip()
 
-    def draw_line(ax, title: str, text: str, *, colors: list[str] | None = None):
+    training_tokens, training_n = _vocab_word_tokens(training_demo, vocab, SAMPLE_DISPLAY_WORDS)
+
+    after_err = model.get("demo_word_error_frac")
+    if after_err is None or not np.isfinite(after_err):
+        after_err = _invalid_word_fraction(demo_after, vocab)
+    after_title = (
+        f"Generated after learning — {100.0 * after_err:.1f}% invalid words (full rollout)"
+    )
+    if "metric_word_error_frac" in model and len(model["metric_word_error_frac"]):
+        train_err = float(model["metric_word_error_frac"][-1])
+        after_title += f"; training metric: {100.0 * train_err:.1f}%"
+
+    rows = [
+        ("Demo snippet from training sequence", training_tokens, None, training_n),
+        ("Generated before learning — green=in vocab, red=not in vocab", demo_before, vocab, None),
+        (after_title + " — green=in vocab, red=not in vocab", demo_after, vocab, None),
+    ]
+
+    fig, axes = plt.subplots(len(rows), 1, figsize=(14, 4.2), constrained_layout=True)
+    for ax, (title, text_or_tokens, word_vocab, n_vocab_words) in zip(axes, rows):
         ax.set_axis_off()
-        x0, y0 = 0.01, 0.55
-        dx = 0.0125
-        x = x0
-        for i, ch in enumerate(text):
-            color = colors[i] if (colors is not None and i < len(colors)) else "0.15"
+        if isinstance(text_or_tokens, list):
+            tokens = text_or_tokens
+            n_total = n_vocab_words if n_vocab_words is not None else len(tokens)
+        else:
+            tokens = text_or_tokens.split()[:SAMPLE_DISPLAY_WORDS]
+            n_total = len(text_or_tokens.split())
+        suffix = (
+            f" (first {SAMPLE_DISPLAY_WORDS} of {n_total} words)"
+            if n_total > SAMPLE_DISPLAY_WORDS
+            else ""
+        )
+        ax.text(0.0, 0.92, title + suffix, transform=ax.transAxes, fontsize=10, va="top")
+
+        if not tokens:
+            continue
+        if word_vocab is None:
             ax.text(
-                x, y0, ch,
+                0.0, 0.35, "   ".join(tokens),
                 transform=ax.transAxes,
                 fontfamily="monospace",
-                fontsize=14,
-                color=color,
+                fontsize=11,
+                color="0.15",
                 va="center",
+                ha="left",
             )
-            x += dx
-        ax.text(0.01, 0.88, title, transform=ax.transAxes, fontsize=12, color="0.15")
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 6.0), constrained_layout=True)
-
-    training_demo = (demo_prompt + demo_target).strip()
-    draw_line(
-        axes[0],
-        "Demo snippet from training sequence",
-        training_demo if training_demo else (demo_target or before),
-    )
-    ax_before, ax_after = axes[1], axes[2]
-
-    def vocab_colors(text: str) -> list[str]:
-        mask = _token_letter_valid_mask(text, vocab)
-        out = []
-        for ch, ok in zip(text, mask):
-            if ch == " ":
-                out.append("0.6")
+        else:
+            shown = [t if len(t) <= 10 else t[:9] + "…" for t in tokens]
+            line = "   ".join(shown)
+            if all(t not in word_vocab for t in tokens):
+                ax.text(
+                    0.0, 0.35, line,
+                    transform=ax.transAxes,
+                    fontfamily="monospace",
+                    fontsize=10,
+                    color="#d62728",
+                    va="center",
+                    ha="left",
+                )
             else:
-                out.append("#2ca02c" if ok else "#d62728")
-        return out
-
-    draw_line(
-        ax_before,
-        "Generated before learning (stochastic) — green=in vocab, red=not in vocab",
-        demo_before or before,
-        colors=vocab_colors(demo_before or before),
-    )
-    draw_line(
-        ax_after,
-        "Generated after learning (stochastic) — green=in vocab, red=not in vocab",
-        demo_after or after,
-        colors=vocab_colors(demo_after or after),
-    )
+                n = len(shown)
+                xs = np.linspace(0.0, 0.98, n) if n > 1 else np.array([0.0])
+                for x, tok, raw in zip(xs, shown, tokens):
+                    color = "#2ca02c" if raw in word_vocab else "#d62728"
+                    ax.text(
+                        x, 0.35, tok,
+                        transform=ax.transAxes,
+                        fontfamily="monospace",
+                        fontsize=10,
+                        color=color,
+                        va="center",
+                        ha="left" if n == 1 else "center",
+                    )
 
     fig.savefig(save_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -2838,6 +2971,13 @@ def main() -> None:
     )
 
     if automaton is not None:
+        plot_dfa_grouped_state_correlation(
+            text,
+            hidden_states,
+            save_path=os.path.join(out_dir, "state_correlation_by_dfa_state.png"),
+            spaced=spaced,
+            automaton=automaton,
+        )
         plot_dfa_state_distance_comparison(
             text, hidden_states, automaton,
             save_path=os.path.join(out_dir, "dfa_state_distance_comparison.png"),

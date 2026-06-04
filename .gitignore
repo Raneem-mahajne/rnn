@@ -1,6 +1,7 @@
 input.txt
 experiments/*/input.txt
 experiments/*/model.npz
+NUL.npz
 
 __pycache__/
 *.pyc
