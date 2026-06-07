@@ -1739,6 +1739,24 @@ def _word_trajectory_colors(segments: list[tuple[int, int, str]]) -> dict[str, t
     return {word: cmap(i) for i, word in enumerate(words)}
 
 
+def _square_data_limits(*xy_arrays: np.ndarray, padding_frac: float = 0.12):
+    """Square x/y limits from trajectory data (ignore annotation label offsets)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    for arr in xy_arrays:
+        if arr is None or len(arr) == 0:
+            continue
+        xs.extend([float(arr[:, 0].min()), float(arr[:, 0].max())])
+        ys.extend([float(arr[:, 1].min()), float(arr[:, 1].max())])
+    if not xs:
+        return (-1.0, 1.0), (-1.0, 1.0)
+    cx = 0.5 * (min(xs) + max(xs))
+    cy = 0.5 * (min(ys) + max(ys))
+    half = 0.5 * max(max(xs) - min(xs), max(ys) - min(ys), 1e-3)
+    half *= 1.0 + padding_frac
+    return (cx - half, cx + half), (cy - half, cy + half)
+
+
 def plot_space_to_space_trajectories(
     text: str,
     hidden_states: np.ndarray,
@@ -1748,6 +1766,9 @@ def plot_space_to_space_trajectories(
     free_rollout_steps: int = 10,
     closed_loop_steps: int | None = None,
     closed_loop_seed: int = 0,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+    annot_style: str = "leaders",
 ):
     """PCA plot of every hidden-state path from one space timestep to the next.
 
@@ -1758,7 +1779,11 @@ def plot_space_to_space_trajectories(
     if len(text) < 2 or not segments:
         return
 
-    projected, mean, components, _ = fit_pca_2d_with_evr(hidden_states)
+    projected, mean, components, evr = fit_pca_2d_with_evr(hidden_states)
+    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+    xlabel = f"PC1 ({pc1:.1f}%)"
+    ylabel = f"PC2 ({pc2:.1f}%)"
     word_colors = _word_trajectory_colors(segments)
 
     if closed_loop_steps is None:
@@ -1772,52 +1797,8 @@ def plot_space_to_space_trajectories(
     ax_paths = axes[1] if ncols >= 2 else axes[0]
     ax_gen = axes[2] if ncols >= 3 else None
 
-    # Background: no-input recurrent dynamics vector field in PCA (optional).
-    x_min = x_max = y_min = y_max = None
-    grid_x = grid_y = U = V = None
-    if model is not None:
-        z = projected
-        x_min, x_max = float(np.min(z[:, 0])), float(np.max(z[:, 0]))
-        y_min, y_max = float(np.min(z[:, 1])), float(np.max(z[:, 1]))
-        x_pad = max((x_max - x_min) * 0.08, 1e-3)
-        y_pad = max((y_max - y_min) * 0.08, 1e-3)
-        x_min, x_max = x_min - x_pad, x_max + x_pad
-        y_min, y_max = y_min - y_pad, y_max + y_pad
-
-        grid_resolution = 26
-        xs = np.linspace(x_min, x_max, grid_resolution)
-        ys = np.linspace(y_min, y_max, grid_resolution)
-        grid_x, grid_y = np.meshgrid(xs, ys)
-        z_grid = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-
-        h = reconstruct_from_pca(z_grid, mean, components)
-        W_hh = np.asarray(model["weights_hidden_to_hidden"])
-        b_h = np.asarray(model["bias_hidden"]).ravel()
-        use_relu = bool(model.get("use_relu", False))
-        h_next = no_input_hidden_step(h, W_hh, b_h, use_relu=use_relu)
-        z_next = (h_next - mean) @ components.T
-        d = z_next - z_grid
-        U = d[:, 0].reshape(grid_resolution, grid_resolution)
-        V = d[:, 1].reshape(grid_resolution, grid_resolution)
-
-        # Match the smaller-arrow settings used in vector_field_grid_pca_no_input.png
-        for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
-            ax.quiver(
-                grid_x,
-                grid_y,
-                U,
-                V,
-                angles="xy",
-                scale_units="xy",
-                scale=35.0,
-                width=0.0022,
-                headwidth=3.6,
-                headlength=4.6,
-                headaxislength=3.6,
-                color="#000000",
-                alpha=0.18,
-                zorder=1,
-            )
+    rollout_paths: list[np.ndarray] = []
+    gen_z = projected
 
     # Panel: trained (observed) trajectories colored by true word segment.
     for start, end, segment_text in segments:
@@ -1829,19 +1810,6 @@ def plot_space_to_space_trajectories(
         ax_paths.plot(
             path[:, 0], path[:, 1],
             color=color, linewidth=1.6, alpha=0.55, solid_capstyle="round", zorder=2,
-        )
-        if len(path) >= 2:
-            ax_paths.quiver(
-                path[:-1, 0], path[:-1, 1],
-                path[1:, 0] - path[:-1, 0], path[1:, 1] - path[:-1, 1],
-                angles="xy", scale_units="xy", scale=1,
-                color=color, width=0.005, headwidth=4.5, headlength=5.5,
-                headaxislength=4.5, alpha=0.95, zorder=3,
-            )
-        ax_paths.scatter(
-            path[:, 0], path[:, 1],
-            s=32, c=[color] * len(path),
-            edgecolors="black", linewidths=0.4, zorder=4,
         )
 
     # Panel 2: free dynamics rollouts from each observed hidden state (no input).
@@ -1857,19 +1825,6 @@ def plot_space_to_space_trajectories(
                 if 0 <= t < len(word_at_t):
                     word_at_t[t] = word
 
-        # Start points (actual states), colored by word.
-        start_colors = [word_colors.get(word_at_t[t], (0.2, 0.2, 0.2, 1.0)) for t in range(len(text))]
-        ax_free.scatter(
-            projected[:, 0],
-            projected[:, 1],
-            s=16,
-            c=start_colors,
-            alpha=0.35,
-            edgecolors="black",
-            linewidths=0.25,
-            zorder=2,
-        )
-
         use_relu = bool(model.get("use_relu", False))
         for t, h0 in enumerate(hidden_states):
             h = np.asarray(h0, dtype=float)
@@ -1881,24 +1836,9 @@ def plot_space_to_space_trajectories(
             zs = np.asarray(zs, dtype=float)
             if zs.shape[0] < 2:
                 continue
+            rollout_paths.append(zs)
             color = word_colors.get(word_at_t[t], "0.15")
             ax_free.plot(zs[:, 0], zs[:, 1], color=color, linewidth=1.0, alpha=0.22, zorder=3)
-            ax_free.quiver(
-                zs[:-1, 0],
-                zs[:-1, 1],
-                zs[1:, 0] - zs[:-1, 0],
-                zs[1:, 1] - zs[:-1, 1],
-                angles="xy",
-                scale_units="xy",
-                scale=1,
-                color=color,
-                width=0.0032,
-                headwidth=4.0,
-                headlength=5.0,
-                headaxislength=4.0,
-                alpha=0.45,
-                zorder=4,
-            )
 
     # Panel 3: closed-loop generation (sampled; previous output fed back as input).
     if ax_gen is not None and model is not None and closed_loop_steps > 1:
@@ -1963,32 +1903,61 @@ def plot_space_to_space_trajectories(
 
             ax_gen.plot(path[:, 0], path[:, 1], color=color, linewidth=1.3, alpha=0.40, zorder=2)
             if len(path) >= 2:
-                ax_gen.quiver(
-                    path[:-1, 0],
-                    path[:-1, 1],
-                    path[1:, 0] - path[:-1, 0],
-                    path[1:, 1] - path[:-1, 1],
-                    angles="xy",
-                    scale_units="xy",
-                    scale=1,
-                    color=color,
-                    width=0.0036,
-                    headwidth=4.0,
-                    headlength=5.0,
-                    headaxislength=4.0,
-                    alpha=0.55,
-                    zorder=4,
+                ax_gen.scatter(
+                    path[:, 0], path[:, 1],
+                    s=18, c=[color] * len(path),
+                    alpha=0.55, edgecolors="black", linewidths=0.25, zorder=3,
                 )
-            ax_gen.scatter(
-                path[:, 0],
-                path[:, 1],
-                s=18,
-                c=[color] * len(path),
-                alpha=0.55,
-                edgecolors="black",
-                linewidths=0.25,
-                zorder=3,
+
+    limit_arrays = [projected, gen_z]
+    limit_arrays.extend(rollout_paths)
+    xlim, ylim = _square_data_limits(*limit_arrays)
+
+    if model is not None:
+        grid_resolution = 26
+        xs = np.linspace(xlim[0], xlim[1], grid_resolution)
+        ys = np.linspace(ylim[0], ylim[1], grid_resolution)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        z_grid = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+
+        h = reconstruct_from_pca(z_grid, mean, components)
+        W_hh = np.asarray(model["weights_hidden_to_hidden"])
+        b_h = np.asarray(model["bias_hidden"]).ravel()
+        use_relu = bool(model.get("use_relu", False))
+        h_next = no_input_hidden_step(h, W_hh, b_h, use_relu=use_relu)
+        z_next = (h_next - mean) @ components.T
+        d = z_next - z_grid
+        U = d[:, 0].reshape(grid_resolution, grid_resolution)
+        V = d[:, 1].reshape(grid_resolution, grid_resolution)
+
+        for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
+            ax.quiver(
+                grid_x,
+                grid_y,
+                U,
+                V,
+                angles="xy",
+                scale_units="xy",
+                scale=35.0,
+                width=0.0022,
+                headwidth=3.6,
+                headlength=4.6,
+                headaxislength=3.6,
+                color="#000000",
+                alpha=0.18,
+                zorder=1,
             )
+
+    # Observed test-window prefix labels at their trained PCA positions on every panel.
+    for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
+        add_pca_point_annotations(
+            ax,
+            text,
+            projected,
+            spaced=spaced,
+            automaton=automaton,
+            annot_style=annot_style,
+        )
 
     handles = [
         Patch(facecolor=word_colors[w], edgecolor="#333333", label=w)
@@ -2007,12 +1976,12 @@ def plot_space_to_space_trajectories(
     for ax in (a for a in (ax_paths, ax_free, ax_gen) if a is not None):
         ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
         ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
         ax.grid(True, linestyle=":", alpha=0.35)
-        if x_min is not None and y_min is not None:
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
 
     ax_paths.set_title(f"Trained (observed) trajectories (PCA)\n{len(segments)} segments, {len(text)} chars")
     if ax_free is not None:
@@ -2135,9 +2104,9 @@ def plot_pca_dfa_analysis(
     *,
     spaced: bool = False,
     annot_style: str = "leaders",
-    embedding: str = "umap",
+    embedding: str = "pca",
 ):
-    """Embedding (default: UMAP) beside the min-DFA with matching state colors."""
+    """Embedding (default: PCA) beside the min-DFA with matching state colors."""
     if len(text) < 2:
         return
     embedding = (embedding or "umap").lower()
@@ -2941,6 +2910,9 @@ def main() -> None:
                 out_dir, "word_trajectories_pca.png"
             ),
             model=model,
+            spaced=spaced,
+            automaton=automaton,
+            annot_style=args.dfa_annot_style,
         )
 
     plot_pca_next_char_probability_panels(
