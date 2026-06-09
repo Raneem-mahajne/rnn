@@ -69,6 +69,9 @@ def main() -> None:
             "--length", str(cfg["viz_length"]),
         ])
 
+        if name == "ten_word_overlap_s":
+            run([sys.executable, "scripts/build_readme.py"])
+
     print(f"\nDone. Plots under experiments/<name>/plots/")
 
 
