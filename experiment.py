@@ -12,7 +12,7 @@ _BASE_CONFIG: dict[str, dict] = {
     "ten_word_overlap": {
         "chars": 50_000,
         "steps": 15_000,
-        "viz_length": 150,
+        "viz_length": 50,
         "hidden_size": 32,
         "sequence_length": 40,
     },
@@ -20,7 +20,7 @@ _BASE_CONFIG: dict[str, dict] = {
     "sixteen_word_overlap": {
         "chars": 50_000,
         "steps": 15_000,
-        "viz_length": 150,
+        "viz_length": 50,
         "hidden_size": 32,
         "sequence_length": 40,
     },
@@ -30,7 +30,7 @@ _BASE_CONFIG: dict[str, dict] = {
     "ten_four_letter_overlap": {
         "chars": 50_000,
         "steps": 15_000,
-        "viz_length": 150,
+        "viz_length": 50,
         "hidden_size": 32,
         "sequence_length": 40,
     },
@@ -38,7 +38,7 @@ _BASE_CONFIG: dict[str, dict] = {
         "regime": "ten_four_letter_overlap",
         "chars": 50_000,
         "steps": 15_000,
-        "viz_length": 150,
+        "viz_length": 50,
         "hidden_size": 50,
         "dale": True,
         "e_fraction": 0.8,

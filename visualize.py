@@ -90,6 +90,8 @@ from vocab_diagrams import (
     dfa_state_at_position,
     dfa_state_label,
     draw_minimized_dfa_on_axes,
+    in_word_prefix_at_position,
+    segment_corpus_by_words,
     vocabulary_for_experiment,
     write_vocabulary_diagrams,
 )
@@ -120,10 +122,14 @@ def load_model(path: str = "model.npz"):
         model["sample_before"] = str(data["sample_before"])
     if "sample_after" in data.files:
         model["sample_after"] = str(data["sample_after"])
-    if "demo_target" in data.files:
-        model["demo_target"] = str(data["demo_target"])
-    if "demo_prompt" in data.files:
-        model["demo_prompt"] = str(data["demo_prompt"])
+    if "demo_snippet" in data.files:
+        model["demo_snippet"] = str(data["demo_snippet"])
+    elif "demo_prompt" in data.files or "demo_target" in data.files:
+        model["demo_snippet"] = (
+            str(data["demo_prompt"]) if "demo_prompt" in data.files else ""
+        ) + (
+            str(data["demo_target"]) if "demo_target" in data.files else ""
+        )
     if "demo_before" in data.files:
         model["demo_before"] = str(data["demo_before"])
     if "demo_after" in data.files:
@@ -357,16 +363,63 @@ def corpus_uses_word_spacing(text: str, exp_name: str | None = None) -> bool:
     return " " in text
 
 
-def word_subsequent_label(text: str, index: int) -> str:
-    """Spaced corpora: ' ' on a space; else prefix from after the last space through here."""
-    if index < 0 or index >= len(text):
-        return ""
-    if text[index] == " ":
-        return " "
-    start = index
-    while start > 0 and text[start - 1] != " ":
-        start -= 1
-    return text[start : index + 1]
+_VIS_WORDS: list[str] | None = None
+
+
+def _resolve_words(text: str, words: list[str] | None = None) -> list[str] | None:
+    if words is not None:
+        return words
+    if _VIS_WORDS:
+        return _VIS_WORDS
+    return infer_task_words(text)
+
+
+def _corpus_vocab(text: str, words: list[str] | None = None) -> set[str] | None:
+    w = _resolve_words(text, words)
+    return set(w) if w else None
+
+
+def prefix_axis_label(
+    *, spaced: bool, text: str = "", words: list[str] | None = None,
+) -> str:
+    if spaced:
+        return "prefix since last space"
+    if _corpus_vocab(text, words):
+        return "in-word prefix"
+    return "prefix (≤3 chars)"
+
+
+def word_subsequent_label(
+    text: str,
+    index: int,
+    *,
+    spaced: bool = False,
+    words: list[str] | None = None,
+) -> str:
+    """In-word prefix label at this timestep (space, vocab boundary, or ≤3 chars)."""
+    return in_word_prefix_at_position(
+        text, index, spaced=spaced, vocab=_corpus_vocab(text, words),
+    )
+
+
+def corpus_segments(
+    text: str,
+    words: list[str] | None,
+    *,
+    spaced: bool,
+) -> list[tuple[int, int, str]]:
+    """Word segments: explicit spaces, or implicit vocabulary boundaries."""
+    if spaced and " " in text:
+        return space_to_space_segments(text)
+    vocab = _corpus_vocab(text, words)
+    if vocab:
+        return [
+            (start, end, text[start : end + 1])
+            for start, end, _ in segment_corpus_by_words(text, vocab)
+        ]
+    if text:
+        return [(0, len(text) - 1, text)]
+    return []
 
 
 def space_to_space_segments(text: str) -> list[tuple[int, int, str]]:
@@ -399,34 +452,32 @@ def segment_word_label(segment_text: str) -> str:
     return stripped if stripped else "␣"
 
 
-def context_label(text, index, *, spaced: bool = False):
-    if spaced:
-        return word_subsequent_label(text, index)
+def context_label(text, index, *, spaced: bool = False, words: list[str] | None = None):
+    prefix = word_subsequent_label(text, index, spaced=spaced, words=words)
+    if spaced and prefix == " ":
+        return " "
+    if prefix:
+        return prefix
     previous = "^" if index == 0 else display_char(text[index - 1])
     current = display_char(text[index])
     return f"{previous}{current}@{index}"
 
 
-def timestep_context_label(text, index, *, spaced: bool = False):
-    """Context string for plot labels (trigram, or growing prefix after last space)."""
-    if spaced:
-        return word_subsequent_label(text, index)
-    if index < 0:
-        return ""
-    parts = []
-    for offset in (2, 1, 0):
-        pos = index - offset
-        if pos < 0:
-            parts.append("^")
-        else:
-            parts.append(display_char(text[pos]))
-    return "".join(parts)
+def timestep_context_label(
+    text, index, *, spaced: bool = False, words: list[str] | None = None,
+):
+    """Context string for plot labels (in-word prefix at each timestep)."""
+    return word_subsequent_label(text, index, spaced=spaced, words=words)
 
 
-def timestep_axis_description(text: str, exp_name: str | None = None) -> str:
+def timestep_axis_description(
+    text: str, exp_name: str | None = None, words: list[str] | None = None,
+) -> str:
     if corpus_uses_word_spacing(text, exp_name):
         return "timestep (prefix after space, or ' ')"
-    return "timestep (prev2 + current)"
+    if _corpus_vocab(text, words):
+        return "timestep (in-word prefix)"
+    return "timestep (up to 3 chars)"
 
 
 def infer_task_words(text: str) -> list[str] | None:
@@ -467,7 +518,10 @@ def plot_hidden_states_clustermap(
         return
 
     spaced = corpus_uses_word_spacing(text, exp_name)
-    row_labels = [timestep_context_label(text, t, spaced=spaced) for t in range(n_rows)]
+    words = vocabulary_for_experiment(exp_name) if exp_name else infer_task_words(text)
+    row_labels = [
+        timestep_context_label(text, t, spaced=spaced, words=words) for t in range(n_rows)
+    ]
     col_labels = [f"h{i}" for i in range(n_cols)]
     # Flip orientation: units on rows, timesteps on columns (makes long sequences readable).
     data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels).T
@@ -487,7 +541,9 @@ def plot_hidden_states_clustermap(
         xticklabels=True,
         yticklabels=True,
     )
-    grid.ax_heatmap.set_xlabel(timestep_axis_description(text, exp_name))
+    grid.ax_heatmap.set_xlabel(
+        timestep_axis_description(text, exp_name, words=words),
+    )
     grid.ax_heatmap.set_ylabel("hidden unit")
     grid.ax_heatmap.tick_params(axis="y", labelsize=8)
     grid.ax_heatmap.tick_params(axis="x", labelsize=7)
@@ -500,9 +556,11 @@ def plot_hidden_states_clustermap(
     print(f"wrote {save_path}")
 
 
-def prefix_tick_label(text: str, index: int, *, spaced: bool) -> str:
-    """Axis tick text: in-word prefix since last space (␣ on spaces)."""
-    label = prefix_annotation_label(text, index, spaced=spaced)
+def prefix_tick_label(
+    text: str, index: int, *, spaced: bool, words: list[str] | None = None,
+) -> str:
+    """Axis tick text: in-word prefix (␣ on spaces when spaced)."""
+    label = prefix_annotation_label(text, index, spaced=spaced, words=words)
     return "␣" if label == " " else label
 
 
@@ -514,26 +572,32 @@ def plot_hidden_states_correlation_clustermap(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
+    words: list[str] | None = None,
 ):
     """One clustered matrix: Pearson r between hidden states at each timestep."""
     n = hidden_states.shape[0]
     if n < 2:
         return
 
-    labels = [prefix_tick_label(text, t, spaced=spaced) for t in range(n)]
-    corr = np.corrcoef(hidden_states)
-    np.fill_diagonal(corr, 1.0)
-    corr = np.nan_to_num(corr, nan=0.0)
-
-    data = pd.DataFrame(corr, index=labels, columns=labels)
+    labels = [
+        prefix_tick_label(text, t, spaced=spaced, words=words) for t in range(n)
+    ]
+    vocab = _corpus_vocab(text, words)
 
     state_ids = None
     state_colors = None
     if automaton is not None:
         state_ids = [
-            dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+            dfa_state_at_position(
+                text, t, automaton, spaced=spaced, vocab=vocab,
+            ) for t in range(n)
         ]
         state_colors = _state_id_colors(state_ids)
+
+    corr = np.corrcoef(hidden_states)
+    np.fill_diagonal(corr, 1.0)
+    corr = np.nan_to_num(corr, nan=0.0)
+    data = pd.DataFrame(corr, index=labels, columns=labels)
 
     panel = max(10.0, n * 0.2)
     grid = sns.clustermap(
@@ -560,11 +624,7 @@ def plot_hidden_states_correlation_clustermap(
         for tick, idx in zip(grid.ax_heatmap.get_xticklabels(), col_order):
             tick.set_color(state_colors[state_ids[idx]])
 
-    axis_label = (
-        "prefix since last space"
-        if spaced
-        else "stream prefix"
-    )
+    axis_label = prefix_axis_label(spaced=spaced, text=text, words=words)
     grid.ax_heatmap.set_xlabel(axis_label)
     grid.ax_heatmap.set_ylabel(axis_label)
     grid.ax_heatmap.tick_params(axis="both", labelsize=7)
@@ -607,7 +667,9 @@ def plot_dfa_grouped_state_correlation(
         return
 
     state_ids = [
-        dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+        dfa_state_at_position(
+            text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+        ) for t in range(n)
     ]
     by_state: dict[int, list[int]] = {}
     for t, sid in enumerate(state_ids):
@@ -619,7 +681,7 @@ def plot_dfa_grouped_state_correlation(
     for sid in sorted(by_state.keys()):
         idxs = sorted(
             by_state[sid],
-            key=lambda t: prefix_tick_label(text, t, spaced=spaced),
+            key=lambda t: prefix_tick_label(text, t, spaced=spaced, words=_resolve_words(text)),
         )
         order.extend(idxs)
         boundaries.append(len(order))
@@ -717,7 +779,9 @@ def plot_dfa_state_distance_comparison(
         return
 
     state_ids = [
-        dfa_state_at_position(text, t, automaton, spaced=spaced) for t in range(n)
+        dfa_state_at_position(
+            text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+        ) for t in range(n)
     ]
     within, between, same_input = pairwise_hidden_state_distance_groups(
         text, hidden_states, state_ids
@@ -862,7 +926,9 @@ def prediction_entropy(probs):
     return -np.sum(p * np.log(p), axis=1)
 
 
-def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
+def build_pca_plane_grid(
+    text, hidden_states, grid_resolution=120, *, spaced: bool = False,
+):
     """PCA mesh and 2D-reconstructed hidden states on a grid covering data + labels."""
     projected, mean, components = fit_pca_2d(hidden_states)
     x_min, x_max = projected[:, 0].min(), projected[:, 0].max()
@@ -870,7 +936,9 @@ def build_pca_plane_grid(text, hidden_states, grid_resolution=120):
     x_pad = max((x_max - x_min) * 0.12, 1e-3)
     y_pad = max((y_max - y_min) * 0.12, 1e-3)
     if text:
-        _, _, _, label_positions = layout_trigram_labels(text, projected)
+        _, _, _, label_positions = layout_trigram_labels(
+            text, projected, spaced=spaced,
+        )
         if label_positions:
             text_positions = np.array(list(label_positions.values()))
             x_min = min(x_min, text_positions[:, 0].min())
@@ -955,7 +1023,7 @@ def plot_learning_curve(model, save_path):
 
 
 def _token_letter_valid_mask(text: str, vocab: set[str]) -> list[bool]:
-    """Per-character mask: True if char is in a token that is exactly in vocab."""
+    """Per-character mask: True if char is in a whitespace token in vocab."""
     mask = [False] * len(text)
     if not vocab or not text:
         return mask
@@ -976,101 +1044,105 @@ def _token_letter_valid_mask(text: str, vocab: set[str]) -> list[bool]:
     return mask
 
 
-SAMPLE_DISPLAY_WORDS = 15
+def _char_vocab_word_mask(text: str, vocab: set[str], *, spaced: bool) -> list[bool]:
+    """Per-character mask: True when the char belongs to an in-vocabulary word."""
+    mask = [False] * len(text)
+    if not vocab or not text:
+        return mask
+    if spaced:
+        return _token_letter_valid_mask(text, vocab)
+    for start, end, word in segment_corpus_by_words(text, vocab):
+        ok = word in vocab
+        for k in range(start, end + 1):
+            mask[k] = ok
+    return mask
 
 
-def _vocab_word_tokens(text: str, vocab: set[str], max_words: int) -> tuple[list[str], int]:
-    """Whitespace tokens that are whole in-vocabulary words."""
-    all_vocab = [t for t in text.split() if t in vocab]
-    return all_vocab[:max_words], len(all_vocab)
+SAMPLE_DISPLAY_LEN = 50
+
+
+def _draw_sample_chars(
+    ax,
+    text: str,
+    y: float,
+    *,
+    vocab: set[str] | None = None,
+    spaced: bool = False,
+) -> None:
+    snippet = text[:SAMPLE_DISPLAY_LEN]
+    if not snippet:
+        return
+    n = len(snippet)
+    x_step = min(0.019, 0.98 / max(n - 1, 1))
+    if vocab is None:
+        ax.text(
+            0.0, y, snippet,
+            transform=ax.transAxes,
+            fontfamily="monospace",
+            fontsize=10,
+            color="0.15",
+            va="center",
+            ha="left",
+        )
+        return
+    mask = _char_vocab_word_mask(snippet, vocab, spaced=spaced)
+    for i, ch in enumerate(snippet):
+        color = "#2ca02c" if mask[i] else "#d62728"
+        ax.text(
+            i * x_step, y, display_char(ch),
+            transform=ax.transAxes,
+            fontfamily="monospace",
+            fontsize=10,
+            color=color,
+            va="center",
+            ha="left",
+        )
 
 
 def plot_sample_before_after(model, save_path: str) -> None:
-    """Stochastic samples before/after training; first N words on one line."""
+    """Stochastic samples before/after training; fixed-length char snippets."""
     if "sample_before" not in model or "sample_after" not in model:
         print(f"skip {save_path}: re-run min-char-rnn.py to record samples")
         return
 
     vocab = set(map(str, model.get("vocab_words", [])))
-    demo_prompt = str(model.get("demo_prompt", ""))
-    demo_target = str(model.get("demo_target", ""))
+    demo_snippet = str(model.get("demo_snippet", ""))[:SAMPLE_DISPLAY_LEN]
     demo_before = str(model.get("demo_before", "")) or str(model["sample_before"])
     demo_after = str(model.get("demo_after", "")) or str(model["sample_after"])
-    training_demo = (demo_prompt + demo_target).strip()
-
-    training_tokens, training_n = _vocab_word_tokens(training_demo, vocab, SAMPLE_DISPLAY_WORDS)
+    demo_before = demo_before[:SAMPLE_DISPLAY_LEN]
+    demo_after = demo_after[:SAMPLE_DISPLAY_LEN]
+    spaced = " " in demo_snippet or " " in demo_after
 
     after_err = model.get("demo_word_error_frac")
     if after_err is None or not np.isfinite(after_err):
         after_err = _invalid_word_fraction(demo_after, vocab)
-    after_title = (
-        f"Generated after learning — {100.0 * after_err:.1f}% invalid words (full rollout)"
-    )
+    after_title = f"Generated after learning — {100.0 * after_err:.1f}% invalid words"
     if "metric_word_error_frac" in model and len(model["metric_word_error_frac"]):
         train_err = float(model["metric_word_error_frac"][-1])
         after_title += f"; training metric: {100.0 * train_err:.1f}%"
 
     rows = [
-        ("Demo snippet from training sequence", training_tokens, None, training_n),
-        ("Generated before learning — green=in vocab, red=not in vocab", demo_before, vocab, None),
-        (after_title + " — green=in vocab, red=not in vocab", demo_after, vocab, None),
+        (f"Training corpus ({SAMPLE_DISPLAY_LEN} chars)", demo_snippet, None),
+        (
+            f"Generated before learning ({SAMPLE_DISPLAY_LEN} chars) "
+            "— green=in vocab, red=not",
+            demo_before,
+            vocab,
+        ),
+        (
+            after_title + f" ({SAMPLE_DISPLAY_LEN} chars) — green=in vocab, red=not",
+            demo_after,
+            vocab,
+        ),
     ]
 
-    fig, axes = plt.subplots(len(rows), 1, figsize=(14, 4.2), constrained_layout=True)
-    for ax, (title, text_or_tokens, word_vocab, n_vocab_words) in zip(axes, rows):
+    fig, axes = plt.subplots(len(rows), 1, figsize=(14, 3.6), constrained_layout=True)
+    for ax, (title, snippet, word_vocab) in zip(axes, rows):
         ax.set_axis_off()
-        if isinstance(text_or_tokens, list):
-            tokens = text_or_tokens
-            n_total = n_vocab_words if n_vocab_words is not None else len(tokens)
-        else:
-            tokens = text_or_tokens.split()[:SAMPLE_DISPLAY_WORDS]
-            n_total = len(text_or_tokens.split())
-        suffix = (
-            f" (first {SAMPLE_DISPLAY_WORDS} of {n_total} words)"
-            if n_total > SAMPLE_DISPLAY_WORDS
-            else ""
+        ax.text(0.0, 0.92, title, transform=ax.transAxes, fontsize=10, va="top")
+        _draw_sample_chars(
+            ax, snippet, 0.35, vocab=word_vocab, spaced=spaced,
         )
-        ax.text(0.0, 0.92, title + suffix, transform=ax.transAxes, fontsize=10, va="top")
-
-        if not tokens:
-            continue
-        if word_vocab is None:
-            ax.text(
-                0.0, 0.35, "   ".join(tokens),
-                transform=ax.transAxes,
-                fontfamily="monospace",
-                fontsize=11,
-                color="0.15",
-                va="center",
-                ha="left",
-            )
-        else:
-            shown = [t if len(t) <= 10 else t[:9] + "…" for t in tokens]
-            line = "   ".join(shown)
-            if all(t not in word_vocab for t in tokens):
-                ax.text(
-                    0.0, 0.35, line,
-                    transform=ax.transAxes,
-                    fontfamily="monospace",
-                    fontsize=10,
-                    color="#d62728",
-                    va="center",
-                    ha="left",
-                )
-            else:
-                n = len(shown)
-                xs = np.linspace(0.0, 0.98, n) if n > 1 else np.array([0.0])
-                for x, tok, raw in zip(xs, shown, tokens):
-                    color = "#2ca02c" if raw in word_vocab else "#d62728"
-                    ax.text(
-                        x, 0.35, tok,
-                        transform=ax.transAxes,
-                        fontfamily="monospace",
-                        fontsize=10,
-                        color=color,
-                        va="center",
-                        ha="left" if n == 1 else "center",
-                    )
 
     fig.savefig(save_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -1090,11 +1162,13 @@ def _state_id_colors(state_ids: list[int]) -> dict[int, tuple]:
     return {state: cmap(i) for i, state in enumerate(unique)}
 
 
-def prefix_annotation_label(text: str, index: int, *, spaced: bool) -> str:
-    """Text on annotation boxes: in-word prefix since last space, or stream prefix."""
-    if spaced:
-        return word_subsequent_label(text, index)
-    return text[: index + 1]
+def prefix_annotation_label(
+    text: str, index: int, *, spaced: bool, words: list[str] | None = None,
+) -> str:
+    """Text on annotation boxes: in-word prefix at this timestep."""
+    return word_subsequent_label(
+        text, index, spaced=spaced, words=_resolve_words(text, words),
+    )
 
 
 def _layout_group_label_positions(
@@ -1148,7 +1222,11 @@ def _layout_group_label_positions(
 
 def layout_trigram_labels(text, projected, *, spaced: bool = False):
     """Label positions and grouping for context annotations on PCA plots."""
-    labels = [timestep_context_label(text, i, spaced=spaced) for i in range(len(text))]
+    labels = [
+        timestep_context_label(
+            text, i, spaced=spaced, words=_resolve_words(text),
+        ) for i in range(len(text))
+    ]
     sequence_color = trigram_sequence_colors(labels)
     by_sequence: dict[str, list[int]] = defaultdict(list)
     for i, label in enumerate(labels):
@@ -1255,10 +1333,12 @@ def add_dfa_state_annotations(
     leader_linewidth: float = 1.4,
     annot_style: str = "leaders",
 ):
-    """Point color = min DFA state; annotation text = prefix since last space."""
+    """Point color = min DFA state; annotation text = in-word prefix at timestep."""
     n = len(text)
     state_ids = [
-        dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(n)
+        dfa_state_at_position(
+            text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+        ) for i in range(n)
     ]
     prefixes = [
         prefix_annotation_label(text, i, spaced=spaced) for i in range(n)
@@ -1491,11 +1571,11 @@ def plot_dimred_context_panels(
         ("Isomap", isomap_xy, "Isomap-1", "Isomap-2", "Isomap"),
     ]
 
-    ctx = "prefix since last space" if spaced else "stream prefix"
+    ctx = prefix_axis_label(spaced=spaced, text=text)
     if automaton is not None:
         scheme = f"min DFA state · {ctx}"
     else:
-        scheme = "prefix after space" if spaced else "prev2+current (3-char)"
+        scheme = f"prefix after space" if spaced else prefix_axis_label(spaced=spaced, text=text)
 
     fig, axes = plt.subplots(2, 2, figsize=(18, 14), constrained_layout=True)
     axes = axes.ravel()
@@ -1578,9 +1658,7 @@ def plot_per_char_hidden_state_heatmaps(
         )
 
     axes[-1].set_xlabel(
-        "prefix after space (or ' ') @ timestep"
-        if spaced
-        else "previous + current character @ timestep"
+        f"{prefix_axis_label(spaced=spaced, text=text)} @ timestep"
     )
     fig.suptitle(
         f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
@@ -1775,7 +1853,7 @@ def plot_space_to_space_trajectories(
     If `model` is provided, draw the no-input recurrent vector field in PCA
     as a faint background quiver grid.
     """
-    segments = space_to_space_segments(text)
+    segments = corpus_segments(text, _resolve_words(text), spaced=spaced)
     if len(text) < 2 or not segments:
         return
 
@@ -1887,7 +1965,7 @@ def plot_space_to_space_trajectories(
 
         # Break generated characters into word segments between spaces and color by word
         gen_text = "".join(generated[: len(gen_z)])
-        gen_segments = space_to_space_segments(gen_text)
+        gen_segments = corpus_segments(gen_text, _resolve_words(text), spaced=spaced)
         if not gen_segments:
             gen_segments = [(0, len(gen_text) - 1, gen_text)]
 
@@ -2135,7 +2213,9 @@ def plot_pca_dfa_analysis(
         embed_title = "UMAP"
         embed_subtitle = ""
     state_ids = [
-        dfa_state_at_position(text, i, automaton, spaced=spaced) for i in range(len(text))
+        dfa_state_at_position(
+            text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+        ) for i in range(len(text))
     ]
     state_colors = _state_id_colors(state_ids)
 
@@ -2162,7 +2242,7 @@ def plot_pca_dfa_analysis(
     ax_embed.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax_embed.set_xlabel(xlabel)
     ax_embed.set_ylabel(ylabel)
-    ctx = "prefix since last space" if spaced else "stream prefix"
+    ctx = prefix_axis_label(spaced=spaced, text=text)
     subtitle = f"\n{embed_subtitle}" if embed_subtitle else ""
     ax_embed.set_title(f"{embed_title} (min DFA state · {ctx}){subtitle}")
     ax_embed.grid(True, linestyle=":", alpha=0.35)
@@ -2194,7 +2274,7 @@ def plot_pca_prediction_regions(
         return
 
     grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
-        text, hidden_states, grid_resolution,
+        text, hidden_states, grid_resolution, spaced=spaced,
     )
     probs = next_char_probabilities(model, grid_hidden)
     grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
@@ -2261,9 +2341,12 @@ def plot_pca_prediction_regions(
             fig.colorbar(im, ax=ax, label="entropy (nats)", fraction=0.046, pad=0.02)
 
     if automaton is not None:
-        pca_ctx = "min DFA state (prefix since last space)" if spaced else "min DFA state"
+        pca_ctx = (
+            "min DFA state (prefix since last space)" if spaced
+            else "min DFA state (in-word prefix)"
+        )
     else:
-        pca_ctx = "prefix after space" if spaced else "prev2+current, 3-char"
+        pca_ctx = "prefix after space" if spaced else prefix_axis_label(spaced=spaced, text=text)
     fig.suptitle(
         f"PCA plane ({pca_ctx}) · {original_vocabulary_title(chars, text)}",
         fontsize=12, y=1.01,
@@ -2291,7 +2374,7 @@ def plot_pca_next_char_probability_panels(
         return
 
     grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
-        text, hidden_states, grid_resolution,
+        text, hidden_states, grid_resolution, spaced=spaced,
     )
     probs = next_char_probabilities(model, grid_hidden)
 
@@ -2848,15 +2931,19 @@ def main() -> None:
 
     spaced = corpus_uses_word_spacing(text, args.exp)
     words = vocabulary_for_experiment(args.exp) if args.exp else infer_task_words(text)
+    global _VIS_WORDS
+    _VIS_WORDS = words
     automaton = build_minimized_vocabulary_automaton(words) if words else None
     if automaton is not None:
         print(
             "PCA point colors: minimized DFA state after in-word prefix since last space"
             if spaced
-            else "PCA point colors: minimized DFA state (stream prefix)"
+            else "PCA point colors: minimized DFA state after in-word prefix (vocab boundaries)"
         )
     elif spaced:
         print("annotation mode: prefix after space (e.g. h, ha, hat; ' ' on spaces)")
+    elif words:
+        print("annotation mode: in-word prefix via vocabulary word boundaries")
 
     hidden_states, output_probs = forward_pass(model, text)
     targets = list(text[1:]) + [text[0]]
@@ -2903,7 +2990,7 @@ def main() -> None:
             annot_style=args.dfa_annot_style,
         )
 
-    if spaced:
+    if words:
         plot_space_to_space_trajectories(
             text, hidden_states,
             save_path=os.path.join(
@@ -2940,6 +3027,7 @@ def main() -> None:
         save_path=os.path.join(out_dir, "state_correlation_clustered_heatmap.png"),
         spaced=spaced,
         automaton=automaton,
+        words=words,
     )
 
     if automaton is not None:

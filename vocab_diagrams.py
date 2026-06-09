@@ -278,6 +278,75 @@ def in_word_prefix_since_last_space(text: str, index: int) -> str:
     return text[start : index + 1]
 
 
+def segment_corpus_by_words(text: str, vocab: set[str]) -> list[tuple[int, int, str]]:
+    """Greedy longest-match word segmentation for concatenated (unspaced) corpora."""
+    if not text:
+        return []
+    if not vocab:
+        return [(0, len(text) - 1, text)]
+    words_sorted = sorted(vocab, key=len, reverse=True)
+    segs: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        matched = None
+        for w in words_sorted:
+            end = i + len(w)
+            if end <= n and text[i:end] == w:
+                matched = w
+                break
+        if matched:
+            segs.append((i, i + len(matched) - 1, matched))
+            i += len(matched)
+        else:
+            j = i + 1
+            while j < n and not any(
+                text.startswith(w, j) for w in words_sorted
+            ):
+                j += 1
+            segs.append((i, j - 1, text[i:j]))
+            i = j
+    return segs
+
+
+def word_start_at_index(text: str, index: int, vocab: set[str]) -> int | None:
+    """Start index of the vocabulary word (or in-progress prefix) containing `index`."""
+    if not text or index < 0 or index >= len(text):
+        return None
+    segs = segment_corpus_by_words(text[: index + 1], vocab)
+    if not segs:
+        return None
+    start, end, _ = segs[-1]
+    return start if start <= index <= end else None
+
+
+def in_word_prefix_at_position(
+    text: str,
+    index: int,
+    *,
+    spaced: bool,
+    vocab: set[str] | None = None,
+) -> str:
+    """
+    In-word prefix for plot labels and DFA coloring.
+
+    Spaced corpora: prefix since last space (or ' ' on a space).
+    Unspaced: implicit word boundaries via vocabulary segmentation; if that
+    fails, use up to 3 characters ending at `index`.
+    """
+    if index < 0 or index >= len(text):
+        return ""
+    if spaced:
+        if text[index] == " ":
+            return " "
+        return in_word_prefix_since_last_space(text, index)
+    if vocab:
+        start = word_start_at_index(text, index, vocab)
+        if start is not None:
+            return text[start : index + 1]
+    return text[max(0, index - 2) : index + 1]
+
+
 def walk_dfa_prefix(dfa: DFA, prefix: str) -> int | None:
     """DFA state after reading `prefix` from the start state (None if undefined)."""
     state = dfa.start
@@ -295,21 +364,21 @@ def dfa_state_at_position(
     automaton: MinimizedVocabAutomaton,
     *,
     spaced: bool,
+    vocab: set[str] | None = None,
 ) -> int:
     """
     Minimized DFA state for this position.
 
-    Spaced corpora: reset at each space; walk only the in-word prefix since that
-    delimiter (the space timestep uses the start state). Unspaced: walk the whole
-    prefix from the beginning of the stream.
+    Uses the in-word prefix at this timestep (after last explicit space, or at
+    implicit vocabulary word boundaries when unspaced).
     """
     if spaced and text[index] == " ":
         return automaton.dfa.start
-    fragment = (
-        in_word_prefix_since_last_space(text, index)
-        if spaced
-        else text[: index + 1]
+    fragment = in_word_prefix_at_position(
+        text, index, spaced=spaced, vocab=vocab,
     )
+    if spaced and fragment == " ":
+        return automaton.dfa.start
     state = walk_dfa_prefix(automaton.dfa, fragment)
     return automaton.dfa.start if state is None else state
 

@@ -486,18 +486,9 @@ def restore_params(state: dict[str, np.ndarray]) -> None:
 sample_before_text = None
 sample_after_text = None
 
-# Store a fixed "training snippet vs generated snippet" demo.
-prompt_len = 40
-cont_len = 500
-DEMO_DISPLAY_LEN = 500
-demo_total = prompt_len + cont_len
-max_start = max(0, len(text) - demo_total - 1)
-demo_start = int(np.random.default_rng().integers(0, max_start + 1)) if max_start > 0 else 0
-if demo_start > 0:
-    prev_space = text.rfind(" ", 0, demo_start)
-    demo_start = prev_space + 1 if prev_space >= 0 else 0
-demo_prompt = text[demo_start:demo_start + prompt_len]
-demo_target = text[demo_start + prompt_len:demo_start + demo_total]
+# Fixed-length snippets for samples_before_after.png (same length as viz window).
+DEMO_SNIPPET_LEN = 50
+demo_snippet = text[:DEMO_SNIPPET_LEN]
 demo_before = None
 demo_after = None
 demo_word_error_frac = float("nan")
@@ -575,9 +566,9 @@ while iteration < max_iterations:
         weight_snap_violation_frac.append(0.0)
 
     if iteration == 0:
-      sample_before_text = rollout_text[:DEMO_DISPLAY_LEN]
+      sample_before_text = rollout_text[:DEMO_SNIPPET_LEN]
       demo_rng_seed = METRIC_RNG_BASE
-      demo_before = rollout_text[:DEMO_DISPLAY_LEN]
+      demo_before = rollout_text[:DEMO_SNIPPET_LEN]
 
   # Forward + backward over the window. previous_hidden_state is updated to the last
   # hidden state of *this* window, so the next iteration continues the recurrence smoothly.
@@ -643,9 +634,9 @@ final_rng = np.random.default_rng(METRIC_RNG_BASE + iteration)
 final_word_err, final_letter_valid, rollout_text = stochastic_word_validity_metrics(
     char_to_index[demo_seed_char], vocab_words, rng=final_rng,
 )
-sample_after_text = rollout_text[:DEMO_DISPLAY_LEN]
+sample_after_text = rollout_text[:DEMO_SNIPPET_LEN]
 demo_rng_seed = METRIC_RNG_BASE + iteration
-demo_after = rollout_text[:DEMO_DISPLAY_LEN]
+demo_after = rollout_text[:DEMO_SNIPPET_LEN]
 demo_word_error_frac = invalid_word_fraction(rollout_text, vocab_words)
 
 print(
@@ -695,8 +686,7 @@ np.savez(
     vocab_words=np.array(sorted(vocab_words)),
     sample_before=np.array(sample_before_text if sample_before_text is not None else ""),
     sample_after=np.array(sample_after_text if sample_after_text is not None else ""),
-    demo_prompt=np.array(demo_prompt if demo_prompt is not None else ""),
-    demo_target=np.array(demo_target if demo_target is not None else ""),
+    demo_snippet=np.array(demo_snippet if demo_snippet is not None else ""),
     demo_before=np.array(demo_before if demo_before is not None else ""),
     demo_after=np.array(demo_after if demo_after is not None else ""),
     demo_word_error_frac=np.array(demo_word_error_frac, dtype=np.float64),
