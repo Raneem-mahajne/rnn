@@ -87,6 +87,7 @@ from experiment import (
     model_path,
     plots_dir,
 )
+from readme_figures import numbered_plot_path, remove_legacy_readme_plot_names
 from task import REGIMES
 from rnn_dyn import activation_label, no_input_hidden_step, rnn_hidden_step
 from vocab_diagrams import (
@@ -3325,7 +3326,7 @@ def _draw_ei_guides(ax, boundary: int | None, *, horizontal: bool, vertical: boo
         ax.axvline(boundary - 0.5, color="black", lw=1.0, ls="--")
 
 
-def plot_learned_weights(model, out_dir):
+def plot_learned_weights(model, save_path: str):
     """Input (W_xh) and hidden recurrent (W_hh); E columns red, I blue, 0 white."""
     W_in, W_rec, _W_out, dale_sign = weights_for_plot(model)
     chars = model["chars"]
@@ -3373,7 +3374,6 @@ def plot_learned_weights(model, out_dir):
 
     fig.colorbar(im1, ax=axes, fraction=0.03, pad=0.02, label="weight (E red, I blue)")
     fig.suptitle("Learned weights", y=1.02)
-    save_path = os.path.join(out_dir, "weights.png")
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
@@ -3804,20 +3804,20 @@ def main() -> None:
     print(f"loaded model: hidden_size={model['hidden_size']}, "
           f"vocab_size={model['vocab_size']}, chars={''.join(model['chars'])}")
 
-    plot_learned_weights(model, out_dir)
+    plot_learned_weights(model, save_path=str(numbered_plot_path(out_dir, "weights.png")))
     plot_weight_eigenspectra(
-        model, save_path=os.path.join(out_dir, "weights_eigenspectra.png")
+        model, save_path=str(numbered_plot_path(out_dir, "weights_eigenspectra.png")),
     )
     plot_weight_dynamics_over_training(
-        model, os.path.join(out_dir, "weight_dynamics_over_training.png")
+        model, os.path.join(out_dir, "weight_dynamics_over_training.png"),
     )
     plot_learning_curve(
         model,
-        save_path=os.path.join(out_dir, "learning_curve.png"),
+        save_path=str(numbered_plot_path(out_dir, "learning_curve.png")),
     )
     plot_sample_before_after(
         model,
-        save_path=os.path.join(out_dir, "samples_before_after.png"),
+        save_path=str(numbered_plot_path(out_dir, "samples_before_after.png")),
     )
 
     with open(input_file, "r") as f:
@@ -3855,7 +3855,7 @@ def main() -> None:
         )
 
     def plot_path(name: str) -> str:
-        path = os.path.join(out_dir, name)
+        path = str(numbered_plot_path(out_dir, name))
         return _condensed_save_path(path) if args.condensed else path
 
     cv = condensed_view
@@ -4015,6 +4015,9 @@ def main() -> None:
             spaced=spaced,
             automaton=automaton,
         )
+
+    if args.exp:
+        remove_legacy_readme_plot_names(out_dir)
 
 
 if __name__ == "__main__":

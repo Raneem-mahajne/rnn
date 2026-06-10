@@ -1,4 +1,4 @@
-"""Export trie and DFA SVGs as PNG for README embedding."""
+"""Export trie and DFA SVGs as numbered PNGs for README embedding."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch
 from matplotlib.path import Path as MplPath
 
+from readme_figures import numbered_plot_path
 from task import REGIMES
 from vocab_diagrams import (
     BG_COLOR,
@@ -23,8 +24,10 @@ from vocab_diagrams import (
     _gap_scale,
     _scale_trie_positions,
     _state_font_size,
+    _state_line_step,
     build_minimized_vocabulary_automaton,
     build_trie,
+    dfa_canvas_size,
     draw_minimized_dfa_on_axes,
     layout_trie,
     trie_prefixes,
@@ -34,7 +37,7 @@ from vocab_diagrams import (
 
 def export_trie_png(words: list[str], out_path: Path) -> None:
     root = build_trie(words)
-    nodes, _ = trie_states(root)
+    nodes, _index = trie_states(root)
     prefixes = trie_prefixes(root)
     state_labels = {id(n): {prefixes[id(n)]} for n in nodes}
     radii = _compute_radii(state_labels)
@@ -64,12 +67,15 @@ def export_trie_png(words: list[str], out_path: Path) -> None:
                 Circle((cx, cy), r - 3, fill=False, edgecolor="#333", lw=1.0, zorder=5)
             )
         label = prefixes[nid] or "ε"
-        wrapped, _ = _fit_state({label})
-        fs = _state_font_size(r)
-        ax.text(
-            cx, cy, wrapped[0] if wrapped else "",
-            fontsize=fs, ha="center", va="center", zorder=6,
-        )
+        wrapped, _ = _fit_state({label} if label != "ε" else set())
+        fs = _state_font_size(r, len(wrapped))
+        line_step = _state_line_step(len(wrapped))
+        if len(wrapped) == 1:
+            ax.text(cx, cy, wrapped[0], fontsize=fs, ha="center", va="center", zorder=6)
+        else:
+            y0 = cy - (len(wrapped) - 1) * line_step / 2
+            for i, line in enumerate(wrapped):
+                ax.text(cx, y0 + i * line_step, line, fontsize=fs, ha="center", va="center", zorder=6)
 
     for node in nodes:
         nid = id(node)
@@ -108,7 +114,8 @@ def export_trie_png(words: list[str], out_path: Path) -> None:
 
 def export_dfa_png(words: list[str], out_path: Path) -> None:
     automaton = build_minimized_vocabulary_automaton(words)
-    fig, ax = plt.subplots(figsize=(14, 8), facecolor=BG_COLOR)
+    width, height = dfa_canvas_size(automaton)
+    fig, ax = plt.subplots(figsize=(width / 80, height / 80), facecolor=BG_COLOR)
     draw_minimized_dfa_on_axes(ax, automaton, words)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -118,10 +125,12 @@ def export_dfa_png(words: list[str], out_path: Path) -> None:
 def main() -> None:
     words = REGIMES["ten_word_overlap"]
     plots = Path("experiments/ten_word_overlap_s/plots")
-    export_trie_png(words, plots / "vocabulary_trie.png")
-    export_dfa_png(words, plots / "vocabulary_min_dfa.png")
-    print(f"wrote {plots / 'vocabulary_trie.png'}")
-    print(f"wrote {plots / 'vocabulary_min_dfa.png'}")
+    trie_path = numbered_plot_path(plots, "vocabulary_trie.png")
+    dfa_path = numbered_plot_path(plots, "vocabulary_min_dfa.png")
+    export_trie_png(words, trie_path)
+    export_dfa_png(words, dfa_path)
+    print(f"wrote {trie_path}")
+    print(f"wrote {dfa_path}")
 
 
 if __name__ == "__main__":

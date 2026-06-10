@@ -27,8 +27,9 @@ python run_experiments.py --only ten_word_overlap_s
 
 | Path | Contents |
 |------|----------|
-| `experiments/<name>/plots/` | Full plot suite from `visualize.py` |
-| `docs/figures/` | Copies used by this README (synced by `scripts/build_readme.py`) |
+| `experiments/<name>/plots/` | Numbered README figures (`N_slug.png`) plus auxiliary plots |
+| `experiments/<name>/learning_dynamics/` | Supplementary training-time videos (not numbered figures) |
+| `docs/figures/` | Copies of numbered README figures |
 
 ---
 
@@ -38,11 +39,12 @@ python run_experiments.py --only ten_word_overlap_s
 task.py              # Corpus generator (word-sampling regimes)
 min-char-rnn.py      # Vanilla RNN, BPTT, Adagrad, metrics
 visualize.py         # All analysis figures
+readme_figures.py    # README figure order and numbered filenames
 vocab_diagrams.py    # Trie + minimal DFA construction
 experiment.py        # Per-regime hyperparameters
 run_experiments.py   # Batch train + visualize
-docs/figures/        # README figure copies
-experiments/<name>/  # input.txt, model.npz, plots/
+docs/figures/        # README figure copies (1_vocabulary_trie.png, ...)
+experiments/<name>/  # input.txt, model.npz, plots/, learning_dynamics/
 ```
 
 ---
@@ -66,7 +68,7 @@ Default training for main overlap tasks: **50k characters**, **15k steps**, **$h
 
 ## Paper: Learning words with an RNN
 
-The walkthrough below uses **`ten_word_overlap_s`**. All figures are in `docs/figures/`.
+The walkthrough below uses **`ten_word_overlap_s`** from the most recent full train + visualize run. Numbered figures live in `experiments/ten_word_overlap_s/plots/` and `docs/figures/` as `N_descriptive_name.png` in narrative order.
 
 > **Abstract.** Infants appear to segment fluent speech into words using only distributional statistics - transitional probabilities between syllables - without explicit boundaries (Saffran, Aslin, & Newport, 1996). We train a 32-unit $\tanh$ RNN on a ten-word corpus with overlapping trigrams and visualize hidden activations, next-character predictions, PCA embeddings, correlation structure, and recurrent vector fields. Two organizing principles emerge in hidden space: timesteps cluster by **in-word prefix** (distance from the last space), and orthogonally by **minimized DFA state** after that prefix. Pairwise distances are substantially smaller within DFA state than between states, even when the current input character matches. The framework links infant statistical-learning theory to mechanistic RNN interpretability.
 
@@ -133,16 +135,15 @@ We compile the vocabulary into classical finite-state structures **before** trai
 
 Before training, we compile the word list into a **trie**: a rooted tree whose edges are characters and whose paths spell valid prefixes. Every training word appears as a root-to-terminal path. Overlap is explicit: `cat`, `hat`, `mat`, and `rat` share the suffix `at`; `met`, `pet`, and `net` share `et`. The trie is the literal lexical hypothesis tree the model must implicitly navigate when predicting the next character.
 
-![Figure 1](docs/figures/01_vocabulary_trie.png)
+![Figure 1](docs/figures/1_vocabulary_trie.png)
 
 *Figure 1. Trie over the ten-word vocabulary. Nodes are prefixes; double circles are complete words. Edges are labeled by the consumed character.*
 
-
 The trie is folded into a **minimal DFA** by merging states with identical future continuations. This is the canonical reference machine for our second organizing axis: at each timestep we walk the DFA on the **in-word prefix** (characters since the last space) and record the current state $q_k$. Two timesteps with the same prefix always share a DFA state; two timesteps with the same input character but different prefixes generally do not.
 
-![Figure 2](docs/figures/02_vocabulary_min_dfa.png)
+![Figure 2](docs/figures/2_vocabulary_min_dfa.png)
 
-*Figure 2. Minimized deterministic finite automaton (DFA) for the same vocabulary. Each state is labeled with the set of vocabulary words still consistent with the prefix read since the last space.*
+*Figure 2. Minimized deterministic finite automaton (DFA) for the same vocabulary. Each state lists the vocabulary words still consistent with the prefix read since the last space.*
 
 
 
@@ -177,14 +178,13 @@ We begin by confirming that training succeeds and that generation improves.
 
 We first verify that optimization succeeds. Cross-entropy falls steadily over 15,000 iterations. In parallel we track **word error rate**: sample long strings from the model and count how often whitespace-delimited chunks are not exact vocabulary words. This metric is our analogue of "does the generator respect the statistical word units?" After training, invalid-word rate approaches zero: the model is not merely memorizing local trigrams; it has learned to emit legal words.
 
-![Figure 3](docs/figures/03_learning_curve.png)
+![Figure 3](docs/figures/3_learning_curve.png)
 
 *Figure 3. Training loss (blue, 51-iteration rolling median of per-window cross-entropy) and stochastic word-error rate (orange, right axis: percent of space-delimited tokens not in the vocabulary during long sampled rollouts).*
 
-
 Figure 4 compares **what the model actually generates** before and after learning. The top row is ground-truth stream structure. Before training, characters are essentially unstructured noise with respect to the lexicon. After training, almost every character lies inside a valid vocabulary word. The display uses fixed 50-character windows so before/after comparisons are apples-to-apples.
 
-![Figure 4](docs/figures/04_samples_before_after.png)
+![Figure 4](docs/figures/4_samples_before_after.png)
 
 *Figure 4. Three 50-character rows: excerpt from the training corpus (top), stochastic sample at initialization (middle), stochastic sample after training (bottom). Green/red per-character coloring marks in-vocabulary vs out-of-vocabulary segments in the generated rows.*
 
@@ -196,14 +196,13 @@ Next we inspect the weights directly - the only place lexical structure can be s
 
 The raw parameters reveal which letters drive which hidden units and how units recurrently mix. Input columns show letter-specific tuning; recurrent blocks show long-timescale coupling. With $h=32$ the matrices are small enough to inspect directly. There is no hand-designed word feature: any boundary or lexical structure must be implemented through these weights.
 
-![Figure 5](docs/figures/05_weights.png)
+![Figure 5](docs/figures/5_weights.png)
 
 *Figure 5. Learned weight matrices after training. Left: input weights $W_{xh}$ (character columns $\times$ hidden rows). Right: recurrent weights $W_{hh}$ (hidden $\times$ hidden).*
 
-
 The spectrum of $W_{hh}$ (and related blocks) indicates how many past characters the recurrence can integrate and whether dynamics are contractive or expansive in different directions. For word learning, we expect nontrivial structure here: the network must preserve prefix information across several timesteps without a dedicated counter.
 
-![Figure 6](docs/figures/06_weights_eigenspectra.png)
+![Figure 6](docs/figures/6_weights_eigenspectra.png)
 
 *Figure 6. Eigenvalue spectra of the recurrent and cross-weight blocks, summarizing effective memory timescales and stability of the trained dynamics.*
 
@@ -215,24 +214,21 @@ With parameters fixed, we turn to hidden activations and outputs along the corpu
 
 This is the raw activation trace from which all geometry plots are derived. Each column is $\mathbf{h}_t$ after reading one more character. Visual inspection already suggests structure: activations repeat with similar patterns when the model is at analogous positions inside words, even when the absolute corpus index differs.
 
-![Figure 7](docs/figures/07_activation_heatmap.png)
+![Figure 7](docs/figures/7_activation_heatmap.png)
 
 *Figure 7. Hidden activations over a 50-character analysis window. Rows are hidden units $h_0\ldots h_{31}$; columns are timesteps (input characters shown along the bottom).*
 
-
 Behaviorally, the model is a next-character predictor. Where the trie branches are narrow (late in a word, or after an informative prefix), probability mass concentrates on one or few characters. At ambiguous early prefixes (`c` could start `cat`; `a` is shared widely), mass spreads. Comparing to ground truth shows where the trained network is confident vs uncertain.
 
-![Figure 8](docs/figures/08_next_char_prob_sequence.png)
+![Figure 8](docs/figures/8_next_char_prob_sequence.png)
 
 *Figure 8. Softmax next-character probabilities at every timestep (columns), with the true next character highlighted. Brighter cells are higher predicted probability.*
 
-
 This panel is the first direct evidence for **prefix-axis organization**. Fix an input letter such as `a`. Every occurrence is shown, but columns are sorted/labeled by how far into the current word that `a` appeared. Timesteps with the same prefix produce similar activation profiles even when they occur at unrelated positions in the corpus. The network encodes "where am I inside this word?" not merely "what letter did I just see?"
 
-![Figure 9](docs/figures/09_activation_by_input_char.png)
+![Figure 9](docs/figures/9_activation_by_input_char.png)
 
 *Figure 9. For each input character, all timesteps where that character was read. Columns are labeled by **in-word prefix** (e.g. `h`, `ha`, `hat` after a space). Rows are hidden units; columns are occurrences, optionally clustered by activation similarity.*
-
 
 Clustering across the full 50-timestep window reveals blocks of timesteps with near-identical hidden vectors. Many blocks align with shared prefixes or suffixes (`at`, `et`, etc.). This is unsupervised structure in $\mathbf{h}_t$ using only prefix labels for interpretation - the clustering itself is driven purely by activation similarity.
 
@@ -252,7 +248,6 @@ Because $h=32$, we project $\mathbf{h}_t$ to the plane for visualization. Differ
 
 *Figure 11. Four 2D embeddings of the same 50 hidden states: PCA, UMAP, t-SNE, and Isomap. Points are annotated with in-word prefix labels; colors follow embedding-specific layout.*
 
-
 This is the **central figure**. The DFA is the discrete lexical reference; the PCA scatter is the continuous representation the RNN actually uses. Points with the same DFA color cluster together even when prefix labels differ in length. Conversely, along a single word, the trajectory visits multiple DFA states as more letters disambiguate the lexical hypothesis. The geometry **implements the automaton**: the second organizing axis is not an artifact of coloring.
 
 ![Figure 12](docs/figures/12_dfa_and_embedding_pca.png)
@@ -260,12 +255,14 @@ This is the **central figure**. The DFA is the discrete lexical reference; the P
 *Figure 12. Left: minimized DFA from Figure 2. Right: PCA of hidden states with point color = DFA state and text label = in-word prefix. Leader lines connect grouped prefix annotations.*
 
 
+
+Supplementary media (not a numbered figure): [PCA learning dynamics video](experiments/ten_word_overlap_s/learning_dynamics/hidden_state_pca.mp4) — hidden states on the 50-character window during early training, projected into the **fixed final-model PCA** basis, with playback paced by cumulative displacement. Static Figure 12 shows the endpoint; the video shows how that geometry forms.
+
 These panels answer: **what would the model predict at each location in hidden space?** Low-entropy regions are predictable continuations inside words; high-entropy regions sit at trie branch points where several next characters remain viable. The overlaid real trajectory samples these regions as it moves through prefixes.
 
 ![Figure 13](docs/figures/13_next_char_regions_pca.png)
 
 *Figure 13. PCA plane with 2D-reconstructed hidden states. Left: argmax next-character label in each region. Right: prediction entropy (nats). Overlaid points carry prefix annotations.*
-
 
 Decomposing the output layer per character shows how each letter's logit carves a different region of hidden space. Vowels and consonants that appear in overlapping words (`a`, `t`, `e`, ...) have complex, interleaved regions - reflecting the competition among `-at`, `-et`, and `-ea` families.
 
@@ -273,13 +270,11 @@ Decomposing the output layer per character shows how each letter's logit carves 
 
 *Figure 14. One panel per vocabulary character, showing $P(\text{next}=c\mid\mathbf{h})$ over the PCA plane (from softmax on 2D-reconstructed $\mathbf{h}$).*
 
-
 Between explicit character inputs, the hidden state still evolves under $W_{hh}$ alone. The vector field shows attractor-like structure and drift directions in the PCA plane. This is the intrinsic dynamics the network would follow if characters stopped arriving - relevant for understanding transients at word boundaries and spaces.
 
 ![Figure 15](docs/figures/15_vector_field_grid_pca.png)
 
 *Figure 15. Recurrent vector field in PCA coordinates with **no external input**: $\mathbf{h}_{t+1}=\tanh(W_{hh}\mathbf{h}_t)$, projected to PC1-PC2. Quiver arrows show local flow.*
-
 
 This is the trajectory-level view of the **first organizing axis**. Each word is a path through hidden space starting just after a space. Paths with the same prefix length tend to occupy similar "lanes"; completing a word returns toward a boundary region. The figure makes word segmentation visible as repeated geometric motifs without ever supervising boundaries.
 
@@ -299,13 +294,11 @@ Correlation complements PCA: it measures linear similarity of full 32-dimensiona
 
 *Figure 17. Pearson correlation matrix between hidden vectors at all pairs of timesteps, with hierarchical clustering on rows/columns. Tick labels: in-word prefix; label color = minimized DFA state.*
 
-
 Reordering by DFA state exposes block structure directly. High values on the diagonal mean hidden states in the same automaton state are similar; lower off-diagonal values mean states representing different lexical hypotheses are separated. This is the correlation analogue of Figure 12's coloring.
 
 ![Figure 18](docs/figures/18_state_correlation_by_dfa_state.png)
 
 *Figure 18. Same correlation matrix, but timesteps are **grouped by DFA state** (all states shown). Diagonal blocks are within-state correlations; off-diagonal blocks are between-state.*
-
 
 The quantitative summary: within-state distances are sharply smaller than between-state distances, even though same-input-character pairs can be far apart. The DFA partition captures variance in $\mathbf{h}_t$ that raw character identity alone cannot. Error bars / overlays show means; scatter shows individual pairs.
 
@@ -351,7 +344,7 @@ The DFA axis goes further: the RNN tracks **which branch of the lexical tree** i
 python run_experiments.py --only ten_word_overlap_s
 ```
 
-This generates the corpus, trains the RNN, writes all plots under `experiments/ten_word_overlap_s/plots/`, and runs `scripts/build_readme.py` to refresh `docs/figures/`.
+This generates the corpus, trains the RNN, writes numbered plots under `experiments/ten_word_overlap_s/plots/`, writes `experiments/ten_word_overlap_s/learning_dynamics/hidden_state_pca.mp4`, and runs `scripts/build_readme.py` to refresh `docs/figures/` and this README.
 
 ---
 

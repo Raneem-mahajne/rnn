@@ -598,38 +598,52 @@ def _wrap_label(text: str, max_chars: int = 16) -> list[str]:
 
 
 def _state_label_lines(prefix_set: set[str]) -> list[str]:
-    return _wrap_label(format_prefix_set(prefix_set))
+    """One word per line when a state keeps many lexical hypotheses."""
+    shown = sorted({display_prefix(p) for p in prefix_set}, key=lambda s: (len(s), s))
+    if not shown:
+        return ["ε"]
+    if len(shown) == 1:
+        return shown
+    compact = format_prefix_set(prefix_set)
+    if len(shown) == 2 and len(compact) <= 16:
+        return [compact]
+    return shown
 
 
 def _fit_state(prefix_set: set[str]) -> tuple[list[str], float]:
     """Choose line breaks and the smallest radius that still fits the label."""
-    raw = format_prefix_set(prefix_set)
-    best: tuple[list[str], float] | None = None
-    char_limits = (28, 20, 16, 13, 11, 9, 7)
-    for max_chars in char_limits:
-        if len(raw) <= max_chars and max_chars == char_limits[0]:
-            lines = [raw]
-        else:
-            lines = _wrap_label(raw, max_chars=max_chars)
-        w = max(len(line) for line in lines) * CHAR_W
-        h = len(lines) * LINE_H
-        r = max(MIN_NODE_R, w / 2 + STATE_PAD, h / 2 + STATE_PAD)
-        if best is None or r < best[1]:
-            best = (lines, r)
-    assert best is not None
-    return best
+    lines = _state_label_lines(prefix_set)
+    line_step = LINE_H * (0.82 if len(lines) >= 5 else 0.88 if len(lines) >= 3 else 1.0)
+    w = max(len(line) for line in lines) * CHAR_W
+    h = len(lines) * line_step
+    r = max(MIN_NODE_R, w / 2 + STATE_PAD + 2, h / 2 + STATE_PAD + 2)
+    return lines, r
 
 
 def _compute_radii(state_labels: dict[int, set[str]]) -> dict[int, float]:
     return {key: _fit_state(prefixes)[1] for key, prefixes in state_labels.items()}
 
 
-def _state_font_size(radius: float) -> int:
+def _state_font_size(radius: float, n_lines: int = 1) -> int:
+    if n_lines >= 6:
+        return 6
+    if n_lines >= 4:
+        return 7
+    if n_lines >= 3:
+        return 8
     if radius >= 55:
         return 8
     if radius >= 40:
         return 9
     return 10
+
+
+def _state_line_step(n_lines: int) -> float:
+    if n_lines >= 5:
+        return LINE_H * 0.82
+    if n_lines >= 3:
+        return LINE_H * 0.88
+    return LINE_H
 
 
 def _draw_state(
@@ -641,7 +655,8 @@ def _draw_state(
     prefix_set: set[str],
 ) -> None:
     wrapped, _ = _fit_state(prefix_set)
-    fs = _state_font_size(radius)
+    fs = _state_font_size(radius, len(wrapped))
+    line_step = _state_line_step(len(wrapped))
     if accepting:
         lines.append(
             f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius + 4:.1f}" '
@@ -658,10 +673,10 @@ def _draw_state(
             f'font-size="{fs}px">{_esc(wrapped[0])}</text>'
         )
     else:
-        block_h = (len(wrapped) - 1) * LINE_H
+        block_h = (len(wrapped) - 1) * line_step
         y0 = cy - block_h / 2
         inner = "".join(
-            f'<tspan x="{cx:.1f}" dy="{0 if i == 0 else LINE_H}">{_esc(line)}</tspan>'
+            f'<tspan x="{cx:.1f}" dy="{0 if i == 0 else line_step}">{_esc(line)}</tspan>'
             for i, line in enumerate(wrapped)
         )
         lines.append(
@@ -788,6 +803,16 @@ def _edge_curve_points(
             (nx, ny),
         )
     raise ValueError(f"unexpected edge path: {path!r}")
+
+
+def dfa_canvas_size(automaton: MinimizedVocabAutomaton) -> tuple[float, float]:
+    """Width and height for a minimal-DFA diagram from label sizes and layout."""
+    dfa = automaton.dfa
+    state_labels = _dfa_state_label_map(automaton)
+    radii = _compute_radii(state_labels)
+    gap_scale = _gap_scale(radii)
+    coords = _scale_positions(layout_dfa(dfa), gap_scale=gap_scale)
+    return _canvas_size(coords, radii)
 
 
 def _dfa_state_label_map(automaton: MinimizedVocabAutomaton) -> dict[int, set[str]]:
@@ -924,18 +949,19 @@ def draw_minimized_dfa_on_axes(
             )
         )
         wrapped, _ = _fit_state(prefix_set)
-        fs = _state_font_size(r)
+        fs = _state_font_size(r, len(wrapped))
+        line_step = _state_line_step(len(wrapped))
         if len(wrapped) == 1:
             ax.text(
                 cx, cy, wrapped[0],
                 fontsize=fs, ha="center", va="center", color="#1a1a1a", zorder=6,
             )
         else:
-            block_h = (len(wrapped) - 1) * (LINE_H * 0.85)
+            block_h = (len(wrapped) - 1) * line_step
             y0 = cy - block_h / 2
             for i, line in enumerate(wrapped):
                 ax.text(
-                    cx, y0 + i * LINE_H * 0.85, line,
+                    cx, y0 + i * line_step, line,
                     fontsize=fs, ha="center", va="center", color="#1a1a1a", zorder=6,
                 )
 
