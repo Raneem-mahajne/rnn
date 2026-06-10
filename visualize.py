@@ -66,6 +66,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
@@ -88,10 +89,12 @@ from vocab_diagrams import (
     MinimizedVocabAutomaton,
     build_minimized_vocabulary_automaton,
     dfa_state_at_position,
+    dfa_state_for_prefix,
     dfa_state_label,
     draw_minimized_dfa_on_axes,
     in_word_prefix_at_position,
     segment_corpus_by_words,
+    trie_prefix_display_order,
     vocabulary_for_experiment,
     write_vocabulary_diagrams,
 )
@@ -200,8 +203,19 @@ def forward_pass(model, text: str):
     return hidden_states, output_probs
 
 
-def plot_state_trajectory(hidden_states, color_by_chars, chars, title, save_path):
+def plot_state_trajectory(
+    hidden_states,
+    color_by_chars,
+    chars,
+    title,
+    save_path,
+    *,
+    condensed: CondensedView | None = None,
+):
     """2D scatter of hidden states colored by some categorical char per timestep."""
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        title = _condensed_plot_title(title, condensed)
     if hidden_states.shape[1] != 2:
         raise ValueError(
             f"This plot expects hidden_size == 2, got {hidden_states.shape[1]}. "
@@ -244,8 +258,32 @@ def plot_state_trajectory(hidden_states, color_by_chars, chars, title, save_path
     print(f"wrote {save_path}")
 
 
-def plot_hidden_states_heatmap(text, hidden_states, save_path, *, act_label: str = "tanh"):
+def plot_hidden_states_heatmap(
+    text,
+    hidden_states,
+    save_path,
+    *,
+    act_label: str = "tanh",
+    condensed: CondensedView | None = None,
+    exp_name: str | None = None,
+    automaton: MinimizedVocabAutomaton | None = None,
+    spaced: bool = False,
+    words: list[str] | None = None,
+):
     """Heatmap of every hidden unit's activation over the sequence."""
+    prefix_keys: list[str] | None = None
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        prefix_keys = condensed.labels
+        x_labels = [_display_prefix_label(l) for l in prefix_keys]
+        x_axis = prefix_axis_label(
+            spaced=condensed.spaced, text=text, words=condensed.words,
+        )
+        spaced = condensed.spaced
+        words = condensed.words
+    else:
+        x_labels = list(text)
+        x_axis = "timestep / input character"
     length, hidden_size = hidden_states.shape
     use_relu = act_label == "relu"
     cmap = "magma" if use_relu else "RdBu_r"
@@ -263,10 +301,26 @@ def plot_hidden_states_heatmap(text, hidden_states, save_path, *, act_label: str
     ax.set_yticks(range(hidden_size))
     ax.set_yticklabels([f"h{i}" for i in range(hidden_size)])
     ax.set_xticks(range(length))
-    ax.set_xticklabels(list(text), fontsize=7)
-    ax.set_xlabel("timestep / input character")
+    ax.set_xticklabels(x_labels, fontsize=7)
+    if automaton is not None:
+        if prefix_keys is not None:
+            state_ids = _dfa_state_ids_for_prefixes(
+                prefix_keys, automaton, spaced=spaced,
+            )
+        else:
+            state_ids = _dfa_state_ids_at_timesteps(
+                text, automaton, spaced=spaced, words=words,
+            )
+        _color_tick_labels_by_state_ids(ax.get_xticklabels(), state_ids)
+        x_axis += " · tick color = min DFA state"
+    ax.set_xlabel(x_axis)
     ax.set_ylabel("hidden unit")
-    ax.set_title(f"Hidden state activations ({act_label} output) over the input sequence")
+    ax.set_title(
+        _condensed_plot_title(
+            f"Hidden state activations ({act_label} output) over the input sequence",
+            condensed,
+        )
+    )
 
     fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01, label=f"activation ({act_label})")
     fig.tight_layout()
@@ -402,6 +456,124 @@ def word_subsequent_label(
     )
 
 
+@dataclass
+class CondensedView:
+    """Hidden states averaged over equivalent in-word prefixes (trie positions)."""
+
+    hidden_states: np.ndarray
+    labels: list[str]
+    input_chars: list[str]
+    timestep_indices: list[int]
+    spaced: bool
+    words: list[str] | None = None
+    output_probs: np.ndarray | None = None
+    counts: list[int] = field(default_factory=list)
+    next_chars: list[str] = field(default_factory=list)
+    label_to_index: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.label_to_index = {label: i for i, label in enumerate(self.labels)}
+
+
+def _prefix_condense_order(
+    prefixes: set[str],
+    words: list[str] | None,
+    *,
+    spaced: bool,
+) -> list[str]:
+    """Order condensed prefixes: space (if spaced), then trie BFS, then leftovers."""
+    remaining = set(prefixes)
+    ordered: list[str] = []
+    if spaced and " " in remaining:
+        ordered.append(" ")
+        remaining.discard(" ")
+    if words:
+        for prefix in trie_prefix_display_order(words):
+            if prefix in remaining:
+                ordered.append(prefix)
+                remaining.discard(prefix)
+    ordered.extend(sorted(remaining))
+    return ordered
+
+
+def condense_hidden_states_by_prefix(
+    text: str,
+    hidden_states: np.ndarray,
+    output_probs: np.ndarray | None = None,
+    *,
+    spaced: bool = False,
+    words: list[str] | None = None,
+) -> CondensedView:
+    """
+    Average hidden states (and output probs) over timesteps sharing the same
+    in-word prefix. Rows follow trie BFS order when a word vocabulary is known.
+    """
+    groups: dict[str, list[int]] = defaultdict(list)
+    for t in range(len(text)):
+        label = word_subsequent_label(text, t, spaced=spaced, words=words)
+        groups[label].append(t)
+
+    order = _prefix_condense_order(set(groups), words, spaced=spaced)
+    labels: list[str] = []
+    hs_rows: list[np.ndarray] = []
+    prob_rows: list[np.ndarray] = []
+    input_chars: list[str] = []
+    repr_indices: list[int] = []
+    counts: list[int] = []
+    next_chars: list[str] = []
+    n_text = len(text)
+
+    for label in order:
+        idxs = groups[label]
+        labels.append(label)
+        hs_rows.append(hidden_states[idxs].mean(axis=0))
+        if output_probs is not None:
+            prob_rows.append(output_probs[idxs].mean(axis=0))
+        if label == " ":
+            input_chars.append(" ")
+        elif label:
+            input_chars.append(label[-1])
+        else:
+            input_chars.append(text[idxs[0]])
+        repr_indices.append(idxs[0])
+        counts.append(len(idxs))
+        targets = [text[(t + 1) % n_text] for t in idxs]
+        next_chars.append(max(set(targets), key=targets.count))
+
+    return CondensedView(
+        hidden_states=np.vstack(hs_rows) if hs_rows else hidden_states[:0],
+        labels=labels,
+        input_chars=input_chars,
+        timestep_indices=repr_indices,
+        spaced=spaced,
+        words=words,
+        output_probs=np.vstack(prob_rows) if prob_rows else None,
+        counts=counts,
+        next_chars=next_chars,
+    )
+
+
+def _condensed_save_path(save_path: str) -> str:
+    base, ext = os.path.splitext(save_path)
+    if base.endswith("_condensed"):
+        return save_path
+    return f"{base}_condensed{ext}"
+
+
+def _display_prefix_label(label: str) -> str:
+    return "␣" if label == " " else label
+
+
+def _condensed_plot_title(base: str, condensed: CondensedView | None) -> str:
+    if condensed is None:
+        return base
+    n_inst = sum(condensed.counts)
+    return (
+        f"{base} (condensed: {len(condensed.labels)} prefixes, "
+        f"avg over {n_inst} timesteps)"
+    )
+
+
 def corpus_segments(
     text: str,
     words: list[str] | None,
@@ -510,18 +682,33 @@ def original_vocabulary_title(chars, text: str | None = None) -> str:
 
 
 def plot_hidden_states_clustermap(
-    text, hidden_states, chars, save_path, *, exp_name: str | None = None
+    text,
+    hidden_states,
+    chars,
+    save_path,
+    *,
+    exp_name: str | None = None,
+    condensed: CondensedView | None = None,
+    automaton: MinimizedVocabAutomaton | None = None,
+    spaced: bool = False,
 ):
     """Heatmap (hidden units × timesteps) with seaborn clustermap layout."""
+    prefix_keys: list[str] | None = None
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        spaced = condensed.spaced
+        words = condensed.words
+        prefix_keys = condensed.labels
+        row_labels = [_display_prefix_label(l) for l in prefix_keys]
+    else:
+        spaced = corpus_uses_word_spacing(text, exp_name) or spaced
+        words = vocabulary_for_experiment(exp_name) if exp_name else infer_task_words(text)
+        row_labels = [
+            timestep_context_label(text, t, spaced=spaced, words=words) for t in range(len(text))
+        ]
     n_rows, n_cols = hidden_states.shape
     if n_rows == 0:
         return
-
-    spaced = corpus_uses_word_spacing(text, exp_name)
-    words = vocabulary_for_experiment(exp_name) if exp_name else infer_task_words(text)
-    row_labels = [
-        timestep_context_label(text, t, spaced=spaced, words=words) for t in range(n_rows)
-    ]
     col_labels = [f"h{i}" for i in range(n_cols)]
     # Flip orientation: units on rows, timesteps on columns (makes long sequences readable).
     data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels).T
@@ -541,14 +728,30 @@ def plot_hidden_states_clustermap(
         xticklabels=True,
         yticklabels=True,
     )
-    grid.ax_heatmap.set_xlabel(
-        timestep_axis_description(text, exp_name, words=words),
-    )
+    xlabel = timestep_axis_description(text, exp_name, words=words)
+    if automaton is not None:
+        if prefix_keys is not None:
+            state_ids = _dfa_state_ids_for_prefixes(
+                prefix_keys, automaton, spaced=spaced,
+            )
+        else:
+            state_ids = _dfa_state_ids_at_timesteps(
+                text, automaton, spaced=spaced, words=words,
+            )
+        col_order = grid.dendrogram_col.reordered_ind
+        _color_tick_labels_by_state_ids(
+            grid.ax_heatmap.get_xticklabels(), state_ids, order=col_order,
+        )
+        xlabel += " · tick color = min DFA state"
+    grid.ax_heatmap.set_xlabel(xlabel)
     grid.ax_heatmap.set_ylabel("hidden unit")
     grid.ax_heatmap.tick_params(axis="y", labelsize=8)
     grid.ax_heatmap.tick_params(axis="x", labelsize=7)
     grid.fig.suptitle(
-        f"Hidden states clustered (units × timesteps) · {original_vocabulary_title(chars, text)}",
+        _condensed_plot_title(
+            f"Hidden states clustered (units × timesteps) · {original_vocabulary_title(chars, text)}",
+            condensed,
+        ),
         y=1.02, fontsize=11,
     )
     grid.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -573,26 +776,35 @@ def plot_hidden_states_correlation_clustermap(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
     words: list[str] | None = None,
+    condensed: CondensedView | None = None,
 ):
     """One clustered matrix: Pearson r between hidden states at each timestep."""
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        spaced = condensed.spaced
+        words = condensed.words
+        labels = [_display_prefix_label(l) for l in condensed.labels]
+        if automaton is not None:
+            state_ids = [
+                dfa_state_for_prefix(l, automaton, spaced=spaced) for l in condensed.labels
+            ]
+        else:
+            state_ids = None
+    else:
+        labels = [
+            prefix_tick_label(text, t, spaced=spaced, words=words) for t in range(len(text))
+        ]
+        vocab = _corpus_vocab(text, words)
+        state_ids = None
+        if automaton is not None:
+            state_ids = [
+                dfa_state_at_position(
+                    text, t, automaton, spaced=spaced, vocab=vocab,
+                ) for t in range(len(text))
+            ]
     n = hidden_states.shape[0]
     if n < 2:
         return
-
-    labels = [
-        prefix_tick_label(text, t, spaced=spaced, words=words) for t in range(n)
-    ]
-    vocab = _corpus_vocab(text, words)
-
-    state_ids = None
-    state_colors = None
-    if automaton is not None:
-        state_ids = [
-            dfa_state_at_position(
-                text, t, automaton, spaced=spaced, vocab=vocab,
-            ) for t in range(n)
-        ]
-        state_colors = _state_id_colors(state_ids)
 
     corr = np.corrcoef(hidden_states)
     np.fill_diagonal(corr, 1.0)
@@ -616,13 +828,15 @@ def plot_hidden_states_correlation_clustermap(
         yticklabels=True,
     )
 
-    if state_ids is not None and state_colors is not None:
+    if state_ids is not None:
         row_order = grid.dendrogram_row.reordered_ind
         col_order = grid.dendrogram_col.reordered_ind
-        for tick, idx in zip(grid.ax_heatmap.get_yticklabels(), row_order):
-            tick.set_color(state_colors[state_ids[idx]])
-        for tick, idx in zip(grid.ax_heatmap.get_xticklabels(), col_order):
-            tick.set_color(state_colors[state_ids[idx]])
+        _color_tick_labels_by_state_ids(
+            grid.ax_heatmap.get_yticklabels(), state_ids, order=row_order,
+        )
+        _color_tick_labels_by_state_ids(
+            grid.ax_heatmap.get_xticklabels(), state_ids, order=col_order,
+        )
 
     axis_label = prefix_axis_label(spaced=spaced, text=text, words=words)
     grid.ax_heatmap.set_xlabel(axis_label)
@@ -634,7 +848,10 @@ def plot_hidden_states_correlation_clustermap(
     if automaton is not None:
         title += " · tick color = min DFA state"
     grid.fig.suptitle(
-        f"{title} · {original_vocabulary_title(chars, text)}",
+        _condensed_plot_title(
+            f"{title} · {original_vocabulary_title(chars, text)}",
+            condensed,
+        ),
         y=1.02,
         fontsize=11,
     )
@@ -660,17 +877,33 @@ def plot_dfa_grouped_state_correlation(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton,
+    condensed: CondensedView | None = None,
 ) -> None:
     """Pearson r between hidden vectors; rows/cols grouped by min DFA state (all blocks)."""
-    n = hidden_states.shape[0]
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        spaced = condensed.spaced
+        n = hidden_states.shape[0]
+        state_ids = [
+            dfa_state_for_prefix(l, automaton, spaced=spaced) for l in condensed.labels
+        ]
+        label_at = {
+            i: _display_prefix_label(condensed.labels[i]) for i in range(n)
+        }
+    else:
+        n = hidden_states.shape[0]
+        state_ids = [
+            dfa_state_at_position(
+                text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+            ) for t in range(n)
+        ]
+        label_at = {
+            t: prefix_tick_label(text, t, spaced=spaced, words=_resolve_words(text))
+            for t in range(n)
+        }
     if n < 2:
         return
 
-    state_ids = [
-        dfa_state_at_position(
-            text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
-        ) for t in range(n)
-    ]
     by_state: dict[int, list[int]] = {}
     for t, sid in enumerate(state_ids):
         by_state.setdefault(sid, []).append(t)
@@ -679,10 +912,7 @@ def plot_dfa_grouped_state_correlation(
     boundaries: list[int] = [0]
     block_labels: list[str] = []
     for sid in sorted(by_state.keys()):
-        idxs = sorted(
-            by_state[sid],
-            key=lambda t: prefix_tick_label(text, t, spaced=spaced, words=_resolve_words(text)),
-        )
+        idxs = sorted(by_state[sid], key=lambda t: label_at[t])
         order.extend(idxs)
         boundaries.append(len(order))
         block_labels.append(dfa_state_label(sid, automaton))
@@ -733,8 +963,11 @@ def plot_dfa_grouped_state_correlation(
     ax.set_ylabel("min DFA state (accepted prefixes)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="Pearson r")
     fig.suptitle(
-        "Hidden-state correlation grouped by min DFA state "
-        "(diagonal = within state, off-diagonal = vs other states)",
+        _condensed_plot_title(
+            "Hidden-state correlation grouped by min DFA state "
+            "(diagonal = within state, off-diagonal = vs other states)",
+            condensed,
+        ),
         fontsize=10,
         y=1.02,
     )
@@ -772,19 +1005,29 @@ def plot_dfa_state_distance_comparison(
     save_path: str,
     *,
     spaced: bool = False,
+    condensed: CondensedView | None = None,
 ) -> None:
     """Subsampled pairwise distances + mean (diamond) ± std; y-axis clipped at 0."""
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        spaced = condensed.spaced
+        compare_chars = condensed.input_chars
+        state_ids = [
+            dfa_state_for_prefix(l, automaton, spaced=spaced) for l in condensed.labels
+        ]
+    else:
+        compare_chars = list(text)
+        state_ids = [
+            dfa_state_at_position(
+                text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+            ) for t in range(len(text))
+        ]
     n = hidden_states.shape[0]
     if n < 2:
         return
 
-    state_ids = [
-        dfa_state_at_position(
-            text, t, automaton, spaced=spaced, vocab=_corpus_vocab(text),
-        ) for t in range(n)
-    ]
     within, between, same_input = pairwise_hidden_state_distance_groups(
-        text, hidden_states, state_ids
+        compare_chars, hidden_states, state_ids
     )
     if len(within) == 0 or len(between) == 0:
         print("DFA distance comparison: need both within- and between-state pairs")
@@ -855,7 +1098,8 @@ def plot_dfa_state_distance_comparison(
     ax.set_xlabel("")
     ax.set_ylabel("Euclidean distance ||h_i − h_j||")
     n_pairs = n * (n - 1) // 2
-    ax.set_title(f"Pairwise hidden-state distance ({n_pairs} pairs, n={n} timesteps)")
+    title = f"Pairwise hidden-state distance ({n_pairs} pairs, n={n} timesteps)"
+    ax.set_title(_condensed_plot_title(title, condensed))
     ax.grid(True, axis="y", linestyle=":", alpha=0.35)
     ax.set_xlim(-0.6, len(order) - 0.4)
     ax.set_ylim(bottom=0)
@@ -927,7 +1171,12 @@ def prediction_entropy(probs):
 
 
 def build_pca_plane_grid(
-    text, hidden_states, grid_resolution=120, *, spaced: bool = False,
+    text,
+    hidden_states,
+    grid_resolution=120,
+    *,
+    spaced: bool = False,
+    prefix_labels: list[str] | None = None,
 ):
     """PCA mesh and 2D-reconstructed hidden states on a grid covering data + labels."""
     projected, mean, components = fit_pca_2d(hidden_states)
@@ -935,9 +1184,9 @@ def build_pca_plane_grid(
     y_min, y_max = projected[:, 1].min(), projected[:, 1].max()
     x_pad = max((x_max - x_min) * 0.12, 1e-3)
     y_pad = max((y_max - y_min) * 0.12, 1e-3)
-    if text:
+    if prefix_labels is not None or text:
         _, _, _, label_positions = layout_trigram_labels(
-            text, projected, spaced=spaced,
+            text, projected, spaced=spaced, prefix_labels=prefix_labels,
         )
         if label_positions:
             text_positions = np.array(list(label_positions.values()))
@@ -1162,6 +1411,46 @@ def _state_id_colors(state_ids: list[int]) -> dict[int, tuple]:
     return {state: cmap(i) for i, state in enumerate(unique)}
 
 
+def _dfa_state_ids_for_prefixes(
+    prefixes: list[str],
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool,
+) -> list[int]:
+    return [dfa_state_for_prefix(p, automaton, spaced=spaced) for p in prefixes]
+
+
+def _dfa_state_ids_at_timesteps(
+    text: str,
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool,
+    words: list[str] | None = None,
+) -> list[int]:
+    vocab = _corpus_vocab(text, words)
+    return [
+        dfa_state_at_position(
+            text, t, automaton, spaced=spaced, vocab=vocab,
+        ) for t in range(len(text))
+    ]
+
+
+def _color_tick_labels_by_state_ids(
+    ticks,
+    state_ids: list[int],
+    order: list[int] | None = None,
+) -> None:
+    """Color tick labels by min DFA state; order maps each tick to a state_ids index."""
+    if not state_ids:
+        return
+    state_colors = _state_id_colors(state_ids)
+    if order is None:
+        order = list(range(min(len(ticks), len(state_ids))))
+    for tick, idx in zip(ticks, order):
+        if 0 <= idx < len(state_ids):
+            tick.set_color(state_colors[state_ids[idx]])
+
+
 def prefix_annotation_label(
     text: str, index: int, *, spaced: bool, words: list[str] | None = None,
 ) -> str:
@@ -1220,8 +1509,22 @@ def _layout_group_label_positions(
     return label_positions
 
 
-def layout_trigram_labels(text, projected, *, spaced: bool = False):
+def layout_prefix_labels(projected, prefix_labels: list[str]):
+    """Label layout when each row already has a unique (or grouped) prefix label."""
+    sequence_color = trigram_sequence_colors(prefix_labels)
+    by_label: dict[str, list[int]] = defaultdict(list)
+    for i, label in enumerate(prefix_labels):
+        by_label[label].append(i)
+    label_positions = _layout_group_label_positions(projected, by_label)
+    return prefix_labels, sequence_color, by_label, label_positions
+
+
+def layout_trigram_labels(
+    text, projected, *, spaced: bool = False, prefix_labels: list[str] | None = None,
+):
     """Label positions and grouping for context annotations on PCA plots."""
+    if prefix_labels is not None:
+        return layout_prefix_labels(projected, prefix_labels)
     labels = [
         timestep_context_label(
             text, i, spaced=spaced, words=_resolve_words(text),
@@ -1332,17 +1635,24 @@ def add_dfa_state_annotations(
     label_fontsize: float = CONTEXT_LABEL_FONTSIZE,
     leader_linewidth: float = 1.4,
     annot_style: str = "leaders",
+    prefix_labels: list[str] | None = None,
 ):
     """Point color = min DFA state; annotation text = in-word prefix at timestep."""
-    n = len(text)
-    state_ids = [
-        dfa_state_at_position(
-            text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
-        ) for i in range(n)
-    ]
-    prefixes = [
-        prefix_annotation_label(text, i, spaced=spaced) for i in range(n)
-    ]
+    n = len(prefix_labels) if prefix_labels is not None else len(text)
+    if prefix_labels is not None:
+        prefixes = prefix_labels
+        state_ids = [
+            dfa_state_for_prefix(p, automaton, spaced=spaced) for p in prefixes
+        ]
+    else:
+        state_ids = [
+            dfa_state_at_position(
+                text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+            ) for i in range(n)
+        ]
+        prefixes = [
+            prefix_annotation_label(text, i, spaced=spaced) for i in range(n)
+        ]
     if state_colors is None:
         state_colors = _state_id_colors(state_ids)
     point_colors = [state_colors[s] for s in state_ids]
@@ -1394,10 +1704,12 @@ def add_dfa_state_annotations(
     return text_positions
 
 
-def add_trigram_annotations(ax, text, projected, *, spaced: bool = False):
+def add_trigram_annotations(
+    ax, text, projected, *, spaced: bool = False, prefix_labels: list[str] | None = None,
+):
     """Context-colored points, leader lines, one label per context group."""
     labels, sequence_color, by_sequence, label_positions = layout_trigram_labels(
-        text, projected, spaced=spaced
+        text, projected, spaced=spaced, prefix_labels=prefix_labels,
     )
     label_text = {"␣" if label == " " else label for label in by_sequence}
     point_colors = [sequence_color[label] for label in labels]
@@ -1415,6 +1727,7 @@ def add_pca_point_annotations(
     automaton: MinimizedVocabAutomaton | None = None,
     show_dfa_legend: bool = False,
     annot_style: str = "leaders",
+    prefix_labels: list[str] | None = None,
 ):
     if automaton is not None:
         return add_dfa_state_annotations(
@@ -1425,8 +1738,11 @@ def add_pca_point_annotations(
             spaced=spaced,
             show_legend=show_dfa_legend,
             annot_style=annot_style,
+            prefix_labels=prefix_labels,
         )
-    return add_trigram_annotations(ax, text, projected, spaced=spaced)
+    return add_trigram_annotations(
+        ax, text, projected, spaced=spaced, prefix_labels=prefix_labels,
+    )
 
 
 def _expand_limits_for_annotations(ax, projected, text_positions, base_xlim, base_ylim):
@@ -1495,8 +1811,10 @@ def _plot_2d_hidden_state_labels_on_ax(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
     annot_style: str = "leaders",
+    prefix_labels: list[str] | None = None,
 ) -> None:
-    if len(text) == 0:
+    n = len(prefix_labels) if prefix_labels is not None else len(text)
+    if n == 0:
         return
     text_positions = add_pca_point_annotations(
         ax,
@@ -1505,6 +1823,7 @@ def _plot_2d_hidden_state_labels_on_ax(
         spaced=spaced,
         automaton=automaton,
         annot_style=annot_style,
+        prefix_labels=prefix_labels,
     )
     _expand_limits_for_annotations(
         ax, projected, text_positions,
@@ -1526,10 +1845,17 @@ def plot_dimred_context_panels(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
     annot_style: str = "leaders",
+    condensed: CondensedView | None = None,
 ) -> None:
     """Compare multiple 2D embeddings with the same annotation/coloring scheme."""
     _ = chars
-    n = len(text)
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        prefix_labels = condensed.labels
+        spaced = condensed.spaced
+    else:
+        prefix_labels = None
+    n = hidden_states.shape[0]
     if n < 1:
         return
 
@@ -1590,48 +1916,84 @@ def plot_dimred_context_panels(
             spaced=spaced,
             automaton=automaton,
             annot_style=annot_style,
+            prefix_labels=prefix_labels,
         )
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.tick_params(top=False, right=False)
 
-    fig.suptitle(original_vocabulary_title(chars, text), fontsize=12, y=1.01)
+    fig.suptitle(
+        _condensed_plot_title(original_vocabulary_title(chars, text), condensed),
+        fontsize=12,
+        y=1.01,
+    )
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
 
 def plot_per_char_hidden_state_heatmaps(
-    text, hidden_states, chars, save_path, cluster_rows=True, *, spaced: bool = False
+    text,
+    hidden_states,
+    chars,
+    save_path,
+    cluster_rows=True,
+    *,
+    spaced: bool = False,
+    condensed: CondensedView | None = None,
+    automaton: MinimizedVocabAutomaton | None = None,
 ):
     """Combined per-input-char heatmaps, rows = hidden units, columns = occurrences."""
     hidden_size = hidden_states.shape[1]
-    groups = []
+    groups: list[tuple] = []
 
-    for char in chars:
-        indices = np.array([i for i, text_char in enumerate(text) if i > 0 and text_char == char])
-        if len(indices) == 0:
-            continue
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        spaced = condensed.spaced
+        for char in chars:
+            indices = [i for i, ch in enumerate(condensed.input_chars) if ch == char]
+            if not indices:
+                continue
+            rows = hidden_states[indices]
+            prefix_keys = [condensed.labels[i] for i in indices]
+            labels = [_display_prefix_label(l) for l in prefix_keys]
+            title_suffix = "condensed by prefix"
+            if cluster_rows and len(indices) > 2:
+                order = average_linkage_cluster_order(rows)
+                rows = rows[order]
+                labels = [labels[i] for i in order]
+                prefix_keys = [prefix_keys[i] for i in order]
+                title_suffix += ", clustered"
+            groups.append((char, rows, labels, title_suffix, prefix_keys))
+    else:
+        for char in chars:
+            indices = np.array([i for i, text_char in enumerate(text) if i > 0 and text_char == char])
+            if len(indices) == 0:
+                continue
 
-        rows = hidden_states[indices]
-        labels = [context_label(text, int(i), spaced=spaced) for i in indices]
+            rows = hidden_states[indices]
+            labels = [context_label(text, int(i), spaced=spaced) for i in indices]
+            prefix_keys = [
+                word_subsequent_label(text, int(i), spaced=spaced) for i in indices
+            ]
 
-        if cluster_rows and len(indices) > 2:
-            order = average_linkage_cluster_order(rows)
-            rows = rows[order]
-            labels = [labels[i] for i in order]
-            title_suffix = "clustered by hidden-state similarity"
-        else:
-            title_suffix = "in sequence order"
+            if cluster_rows and len(indices) > 2:
+                order = average_linkage_cluster_order(rows)
+                rows = rows[order]
+                labels = [labels[i] for i in order]
+                prefix_keys = [prefix_keys[i] for i in order]
+                title_suffix = "clustered by hidden-state similarity"
+            else:
+                title_suffix = "in sequence order"
 
-        groups.append((char, rows, labels, title_suffix))
+            groups.append((char, rows, labels, title_suffix, prefix_keys))
 
     if not groups:
         return
 
     fig, axes = plt.subplots(
         len(groups), 1,
-        figsize=(max(12, max(len(labels) for _, _, labels, _ in groups) * 0.28),
+        figsize=(max(12, max(len(labels) for _, _, labels, _, _ in groups) * 0.28),
                  max(3, len(groups) * max(2.1, hidden_size * 0.24))),
         sharey=True,
         constrained_layout=True,
@@ -1639,7 +2001,7 @@ def plot_per_char_hidden_state_heatmaps(
     axes = np.atleast_1d(axes)
     last_image = None
 
-    for ax, (char, rows, labels, title_suffix) in zip(axes, groups):
+    for ax, (char, rows, labels, title_suffix, prefix_keys) in zip(axes, groups):
         im = ax.imshow(
             rows.T,
             aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1,
@@ -1651,17 +2013,26 @@ def plot_per_char_hidden_state_heatmaps(
         ax.set_yticklabels([f"h{i}" for i in range(hidden_size)])
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, fontsize=6, rotation=90)
+        if automaton is not None:
+            state_ids = _dfa_state_ids_for_prefixes(
+                prefix_keys, automaton, spaced=spaced,
+            )
+            _color_tick_labels_by_state_ids(ax.get_xticklabels(), state_ids)
         ax.set_ylabel("hidden unit")
         ax.set_title(
             f"Hidden states for input {display_char(char)!r} "
             f"({len(labels)} occurrences, {title_suffix})"
         )
 
-    axes[-1].set_xlabel(
-        f"{prefix_axis_label(spaced=spaced, text=text)} @ timestep"
-    )
+    xlabel = f"{prefix_axis_label(spaced=spaced, text=text)} @ timestep"
+    if automaton is not None:
+        xlabel += " · tick color = min DFA state"
+    axes[-1].set_xlabel(xlabel)
     fig.suptitle(
-        f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
+        _condensed_plot_title(
+            f"Hidden states by input character · {original_vocabulary_title(chars, text)}",
+            condensed,
+        ),
         y=0.995,
     )
     fig.colorbar(last_image, ax=axes, fraction=0.015, pad=0.01, label="activation")
@@ -1676,11 +2047,17 @@ def trigram_avoidance_points(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
+    prefix_labels: list[str] | None = None,
 ):
     """PC coordinates to keep region letters away from (scatter + label boxes)."""
-    if automaton is not None:
-        prefixes = [prefix_annotation_label(text, i, spaced=spaced) for i in range(len(text))]
+    if prefix_labels is not None:
         by_prefix: dict[str, list[int]] = defaultdict(list)
+        for i, prefix in enumerate(prefix_labels):
+            by_prefix[prefix].append(i)
+        label_positions = _layout_group_label_positions(projected, by_prefix)
+    elif automaton is not None:
+        prefixes = [prefix_annotation_label(text, i, spaced=spaced) for i in range(len(text))]
+        by_prefix = defaultdict(list)
         for i, prefix in enumerate(prefixes):
             by_prefix[prefix].append(i)
         label_positions = _layout_group_label_positions(projected, by_prefix)
@@ -1797,6 +2174,7 @@ def plot_pca_context_labels(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
+    condensed: CondensedView | None = None,
 ):
     """4-panel dim-reduction comparison with shared annotations/colors."""
     plot_dimred_context_panels(
@@ -1807,6 +2185,7 @@ def plot_pca_context_labels(
         spaced=spaced,
         automaton=automaton,
         annot_style="leaders",
+        condensed=condensed,
     )
 
 
@@ -1835,6 +2214,22 @@ def _square_data_limits(*xy_arrays: np.ndarray, padding_frac: float = 0.12):
     return (cx - half, cx + half), (cy - half, cy + half)
 
 
+def _vocabulary_prefix_paths(
+    words: list[str], condensed: CondensedView,
+) -> list[tuple[str, list[int]]]:
+    """For each vocabulary word, indices into condensed rows along its prefix chain."""
+    paths: list[tuple[str, list[int]]] = []
+    for word in words:
+        idxs = [
+            condensed.label_to_index[word[: k + 1]]
+            for k in range(len(word))
+            if word[: k + 1] in condensed.label_to_index
+        ]
+        if len(idxs) >= 2:
+            paths.append((word, idxs))
+    return paths
+
+
 def plot_space_to_space_trajectories(
     text: str,
     hidden_states: np.ndarray,
@@ -1847,12 +2242,54 @@ def plot_space_to_space_trajectories(
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
     annot_style: str = "leaders",
+    condensed: CondensedView | None = None,
 ):
     """PCA plot of every hidden-state path from one space timestep to the next.
 
     If `model` is provided, draw the no-input recurrent vector field in PCA
     as a faint background quiver grid.
     """
+    if condensed is not None:
+        words = condensed.words or _resolve_words(text) or []
+        word_paths = _vocabulary_prefix_paths(words, condensed)
+        if len(word_paths) < 1:
+            return
+        hidden_states = condensed.hidden_states
+        projected, mean, components, evr = fit_pca_2d_with_evr(hidden_states)
+        pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+        pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+        cmap = plt.get_cmap("tab20", max(len(word_paths), 1))
+        fig, ax = plt.subplots(figsize=(12, 10), constrained_layout=True)
+        for i, (word, idxs) in enumerate(word_paths):
+            path = projected[idxs]
+            color = cmap(i)
+            ax.plot(path[:, 0], path[:, 1], color=color, linewidth=1.8, alpha=0.7, label=word)
+            ax.scatter(
+                path[:, 0], path[:, 1], s=30, c=[color], edgecolors="black", linewidths=0.3, zorder=3,
+            )
+        add_pca_point_annotations(
+            ax, text, projected, spaced=condensed.spaced, automaton=automaton,
+            annot_style=annot_style, prefix_labels=condensed.labels,
+        )
+        xlim, ylim = _square_data_limits(projected)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(f"PC1 ({pc1:.1f}%)")
+        ax.set_ylabel(f"PC2 ({pc2:.1f}%)")
+        ax.set_title(
+            _condensed_plot_title(
+                f"Vocabulary word paths through trie prefixes ({len(word_paths)} words)",
+                condensed,
+            )
+        )
+        ax.legend(title="word", loc="best", fontsize=8)
+        ax.grid(True, linestyle=":", alpha=0.35)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"wrote {save_path}")
+        return
+
     segments = corpus_segments(text, _resolve_words(text), spaced=spaced)
     if len(text) < 2 or not segments:
         return
@@ -2087,13 +2524,16 @@ def plot_pca_vector_field(
     grid_resolution: int = 26,
     stride: int = 1,
     scale: float = 35.0,
+    condensed: CondensedView | None = None,
 ) -> None:
     """Grid vector field in PCA: z -> z' from no-input recurrent dynamics.
 
     We reconstruct h from each (PC1,PC2) grid point, apply one recurrent step with x=0,
     then project back to PCA to get the vector z' - z.
     """
-    if len(text) < 3 or hidden_states.shape[0] < 3:
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+    if hidden_states.shape[0] < 3:
         return
 
     projected, mean, components, evr = fit_pca_2d_with_evr(hidden_states)
@@ -2161,7 +2601,12 @@ def plot_pca_vector_field(
     pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
     ax.set_xlabel(f"PC1 ({pc1:.1f}%)")
     ax.set_ylabel(f"PC2 ({pc2:.1f}%)")
-    ax.set_title("Vector field in PCA (grid; no-input recurrent dynamics)")
+    ax.set_title(
+        _condensed_plot_title(
+            "Vector field in PCA (grid; no-input recurrent dynamics)",
+            condensed,
+        )
+    )
     ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
     ax.set_xlim(x_min, x_max)
@@ -2183,9 +2628,16 @@ def plot_pca_dfa_analysis(
     spaced: bool = False,
     annot_style: str = "leaders",
     embedding: str = "pca",
+    condensed: CondensedView | None = None,
 ):
     """Embedding (default: PCA) beside the min-DFA with matching state colors."""
-    if len(text) < 2:
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        prefix_labels = condensed.labels
+        spaced = condensed.spaced
+    else:
+        prefix_labels = None
+    if hidden_states.shape[0] < 2:
         return
     embedding = (embedding or "umap").lower()
     if embedding == "pca":
@@ -2212,11 +2664,16 @@ def plot_pca_dfa_analysis(
         xlabel, ylabel = "UMAP-1", "UMAP-2"
         embed_title = "UMAP"
         embed_subtitle = ""
-    state_ids = [
-        dfa_state_at_position(
-            text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
-        ) for i in range(len(text))
-    ]
+    if prefix_labels is not None:
+        state_ids = [
+            dfa_state_for_prefix(p, automaton, spaced=spaced) for p in prefix_labels
+        ]
+    else:
+        state_ids = [
+            dfa_state_at_position(
+                text, i, automaton, spaced=spaced, vocab=_corpus_vocab(text),
+            ) for i in range(len(text))
+        ]
     state_colors = _state_id_colors(state_ids)
 
     fig, axes = plt.subplots(1, 2, figsize=(28, 11), constrained_layout=True)
@@ -2232,6 +2689,7 @@ def plot_pca_dfa_analysis(
         label_fontsize=18,
         leader_linewidth=2.8,
         annot_style=annot_style,
+        prefix_labels=prefix_labels,
     )
     _expand_limits_for_annotations(
         ax_embed, projected, text_positions,
@@ -2250,7 +2708,10 @@ def plot_pca_dfa_analysis(
     ax_embed.spines["right"].set_visible(False)
     ax_embed.tick_params(top=False, right=False)
 
-    fig.suptitle(", ".join(words), fontsize=12, y=1.01)
+    fig.suptitle(
+        _condensed_plot_title(", ".join(words), condensed),
+        fontsize=12, y=1.01,
+    )
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
@@ -2266,22 +2727,29 @@ def plot_pca_prediction_regions(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
+    condensed: CondensedView | None = None,
 ):
     """PCA panels: argmax next-char regions and softmax entropy, with context labels."""
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        prefix_labels = condensed.labels
+        spaced = condensed.spaced
+    else:
+        prefix_labels = None
     n_points, hidden_size = hidden_states.shape
     vocab_size = len(chars)
-    if n_points < 2 or hidden_size < 1 or len(text) == 0:
+    if n_points < 2 or hidden_size < 1 or (len(text) == 0 and prefix_labels is None):
         return
 
     grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
-        text, hidden_states, grid_resolution, spaced=spaced,
+        text, hidden_states, grid_resolution, spaced=spaced, prefix_labels=prefix_labels,
     )
     probs = next_char_probabilities(model, grid_hidden)
     grid_pred = np.argmax(probs, axis=1).reshape(grid_resolution, grid_resolution)
     grid_entropy = prediction_entropy(probs).reshape(grid_resolution, grid_resolution)
     max_entropy = float(np.log(vocab_size))
     avoid_xy = trigram_avoidance_points(
-        text, projected, spaced=spaced, automaton=automaton
+        text, projected, spaced=spaced, automaton=automaton, prefix_labels=prefix_labels,
     )
     plane_span = max(
         float(np.ptp(grid_x)),
@@ -2331,7 +2799,8 @@ def plot_pca_prediction_regions(
                 xlim=xlim, ylim=ylim,
             )
         add_pca_point_annotations(
-            ax, text, projected, spaced=spaced, automaton=automaton
+            ax, text, projected, spaced=spaced, automaton=automaton,
+            prefix_labels=prefix_labels,
         )
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
@@ -2348,7 +2817,10 @@ def plot_pca_prediction_regions(
     else:
         pca_ctx = "prefix after space" if spaced else prefix_axis_label(spaced=spaced, text=text)
     fig.suptitle(
-        f"PCA plane ({pca_ctx}) · {original_vocabulary_title(chars, text)}",
+        _condensed_plot_title(
+            f"PCA plane ({pca_ctx}) · {original_vocabulary_title(chars, text)}",
+            condensed,
+        ),
         fontsize=12, y=1.01,
     )
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -2366,15 +2838,22 @@ def plot_pca_next_char_probability_panels(
     *,
     spaced: bool = False,
     automaton: MinimizedVocabAutomaton | None = None,
+    condensed: CondensedView | None = None,
 ):
     """One panel per vocab char: P(next = char) over the PCA plane (from softmax)."""
+    if condensed is not None:
+        hidden_states = condensed.hidden_states
+        prefix_labels = condensed.labels
+        spaced = condensed.spaced
+    else:
+        prefix_labels = None
     n_points, hidden_size = hidden_states.shape
     vocab_size = len(chars)
     if n_points < 2 or hidden_size < 1:
         return
 
     grid_x, grid_y, grid_hidden, projected, xlim, ylim = build_pca_plane_grid(
-        text, hidden_states, grid_resolution, spaced=spaced,
+        text, hidden_states, grid_resolution, spaced=spaced, prefix_labels=prefix_labels,
     )
     probs = next_char_probabilities(model, grid_hidden)
 
@@ -2401,7 +2880,8 @@ def plot_pca_next_char_probability_panels(
         ax.set_title(f"P(next = {display_char(char)!r})")
         ax.set_aspect("equal", adjustable="box")
         add_pca_point_annotations(
-            ax, text, projected, spaced=spaced, automaton=automaton
+            ax, text, projected, spaced=spaced, automaton=automaton,
+            prefix_labels=prefix_labels,
         )
 
     for ax in axes[vocab_size:]:
@@ -2419,7 +2899,10 @@ def plot_pca_next_char_probability_panels(
 
     fig.colorbar(last_im, ax=axes[:vocab_size], label="probability", shrink=0.92)
     fig.suptitle(
-        f"P(next char | 2D-reconstructed h) over PCA · {original_vocabulary_title(chars, text)}",
+        _condensed_plot_title(
+            f"P(next char | 2D-reconstructed h) over PCA · {original_vocabulary_title(chars, text)}",
+            condensed,
+        ),
         fontsize=11, y=1.02,
     )
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -2832,11 +3315,38 @@ def plot_weight_eigenspectra(model, save_path: str) -> None:
     print(f"wrote {save_path}")
 
 
-def plot_output_probs(text, output_probs, chars, save_path):
+def plot_output_probs(
+    text,
+    output_probs,
+    chars,
+    save_path,
+    *,
+    condensed: CondensedView | None = None,
+    exp_name: str | None = None,
+    automaton: MinimizedVocabAutomaton | None = None,
+    spaced: bool = False,
+    words: list[str] | None = None,
+):
     """Heatmap of P(next char) over time; overlay the true next char."""
     vocab_size = len(chars)
-    length = len(text)
-    targets = list(text[1:]) + [text[0]]
+    prefix_keys: list[str] | None = None
+    if condensed is not None:
+        output_probs = condensed.output_probs
+        if output_probs is None:
+            return
+        prefix_keys = condensed.labels
+        x_labels = [_display_prefix_label(l) for l in prefix_keys]
+        targets = condensed.next_chars
+        x_axis = prefix_axis_label(
+            spaced=condensed.spaced, text=text, words=condensed.words,
+        )
+        spaced = condensed.spaced
+        words = condensed.words
+    else:
+        x_labels = list(text)
+        targets = list(text[1:]) + [text[0]]
+        x_axis = "timestep / input character"
+    length = output_probs.shape[0]
     target_indices = np.array([chars.index(c) for c in targets])
 
     fig, ax = plt.subplots(figsize=(max(12, length * 0.15), 4))
@@ -2849,10 +3359,26 @@ def plot_output_probs(text, output_probs, chars, save_path):
     ax.set_yticks(range(vocab_size))
     ax.set_yticklabels(chars)
     ax.set_xticks(range(length))
-    ax.set_xticklabels(list(text), fontsize=7)
-    ax.set_xlabel("timestep / input character")
+    ax.set_xticklabels(x_labels, fontsize=7)
+    if automaton is not None:
+        if prefix_keys is not None:
+            state_ids = _dfa_state_ids_for_prefixes(
+                prefix_keys, automaton, spaced=spaced,
+            )
+        else:
+            state_ids = _dfa_state_ids_at_timesteps(
+                text, automaton, spaced=spaced, words=words,
+            )
+        _color_tick_labels_by_state_ids(ax.get_xticklabels(), state_ids)
+        x_axis += " · tick color = min DFA state"
+    ax.set_xlabel(x_axis)
     ax.set_ylabel("predicted next char")
-    ax.set_title("P(next char | input so far)  —  red dots = actual next char")
+    ax.set_title(
+        _condensed_plot_title(
+            "P(next char | input so far)  —  red dots = actual next char",
+            condensed,
+        )
+    )
 
     ax.scatter(
         np.arange(length), target_indices,
@@ -2897,6 +3423,12 @@ def main() -> None:
         default="leaders",
         choices=["leaders", "none", "annots_only"],
         help="DFA annotation style for hidden_states_pca_dfa_analysis.png",
+    )
+    parser.add_argument(
+        "--condensed",
+        action="store_true",
+        help="average hidden states over equivalent in-word prefixes (trie positions); "
+             "writes *_condensed.png figures",
     )
     args = parser.parse_args()
 
@@ -2949,115 +3481,155 @@ def main() -> None:
     targets = list(text[1:]) + [text[0]]
     act_label = activation_label(use_relu=bool(model.get("use_relu", False)))
 
+    condensed_view = None
+    if args.condensed:
+        condensed_view = condense_hidden_states_by_prefix(
+            text, hidden_states, output_probs, spaced=spaced, words=words,
+        )
+        print(
+            f"condensed view: {len(condensed_view.labels)} unique prefixes "
+            f"(avg over {sum(condensed_view.counts)} timesteps)"
+        )
+
+    def plot_path(name: str) -> str:
+        path = os.path.join(out_dir, name)
+        return _condensed_save_path(path) if args.condensed else path
+
+    cv = condensed_view
+
     plot_hidden_states_heatmap(
         text, hidden_states,
-        save_path=os.path.join(out_dir, "activation_heatmap.png"),
+        save_path=plot_path("activation_heatmap.png"),
         act_label=act_label,
+        condensed=cv,
+        exp_name=args.exp,
+        automaton=automaton,
+        spaced=spaced,
+        words=words,
     )
 
     plot_output_probs(
         text, output_probs, model["chars"],
-        save_path=os.path.join(out_dir, "next_char_prob_sequence_heatmap.png"),
+        save_path=plot_path("next_char_prob_sequence_heatmap.png"),
+        condensed=cv,
+        exp_name=args.exp,
+        automaton=automaton,
+        spaced=spaced,
+        words=words,
     )
 
     plot_per_char_hidden_state_heatmaps(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "activation_by_input_char.png"),
+        save_path=plot_path("activation_by_input_char.png"),
         cluster_rows=not args.no_cluster_per_char,
         spaced=spaced,
+        condensed=cv,
+        automaton=automaton,
     )
 
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "embedding_panels_context.png"),
+        save_path=plot_path("embedding_panels_context.png"),
         spaced=spaced,
         automaton=automaton,
+        condensed=cv,
     )
 
     plot_pca_prediction_regions(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "next_char_regions_pca.png"),
+        save_path=plot_path("next_char_regions_pca.png"),
         spaced=spaced,
         automaton=automaton,
+        condensed=cv,
     )
 
     if automaton is not None and words:
         plot_pca_dfa_analysis(
             text, hidden_states, model["chars"], words,
-            save_path=os.path.join(out_dir, "dfa_and_embedding_pca.png"),
+            save_path=plot_path("dfa_and_embedding_pca.png"),
             automaton=automaton,
             spaced=spaced,
             annot_style=args.dfa_annot_style,
+            condensed=cv,
         )
 
     if words:
         plot_space_to_space_trajectories(
             text, hidden_states,
-            save_path=os.path.join(
-                out_dir, "word_trajectories_pca.png"
-            ),
+            save_path=plot_path("word_trajectories_pca.png"),
             model=model,
             spaced=spaced,
             automaton=automaton,
             annot_style=args.dfa_annot_style,
+            condensed=cv,
         )
 
     plot_pca_next_char_probability_panels(
         model, text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "next_char_prob_panels_pca.png"),
+        save_path=plot_path("next_char_prob_panels_pca.png"),
         spaced=spaced,
         automaton=automaton,
+        condensed=cv,
     )
 
     plot_pca_vector_field(
         text,
         hidden_states,
         model,
-        os.path.join(out_dir, "vector_field_grid_pca_no_input.png"),
+        plot_path("vector_field_grid_pca_no_input.png"),
+        condensed=cv,
     )
 
     plot_hidden_states_clustermap(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "activation_clustered_heatmap.png"),
+        save_path=plot_path("activation_clustered_heatmap.png"),
         exp_name=args.exp,
+        condensed=cv,
+        automaton=automaton,
+        spaced=spaced,
     )
 
     plot_hidden_states_correlation_clustermap(
         text, hidden_states, model["chars"],
-        save_path=os.path.join(out_dir, "state_correlation_clustered_heatmap.png"),
+        save_path=plot_path("state_correlation_clustered_heatmap.png"),
         spaced=spaced,
         automaton=automaton,
         words=words,
+        condensed=cv,
     )
 
     if automaton is not None:
         plot_dfa_grouped_state_correlation(
             text,
             hidden_states,
-            save_path=os.path.join(out_dir, "state_correlation_by_dfa_state.png"),
+            save_path=plot_path("state_correlation_by_dfa_state.png"),
             spaced=spaced,
             automaton=automaton,
+            condensed=cv,
         )
         plot_dfa_state_distance_comparison(
             text, hidden_states, automaton,
-            save_path=os.path.join(out_dir, "dfa_state_distance_comparison.png"),
+            save_path=plot_path("dfa_state_distance_comparison.png"),
             spaced=spaced,
+            condensed=cv,
         )
 
     if model["hidden_size"] == 2:
         plot_state_trajectory(
             hidden_states,
-            color_by_chars=list(text),
+            color_by_chars=list(text) if cv is None else cv.input_chars,
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by INPUT char)",
-            save_path=os.path.join(out_dir, "state_trajectory_by_input.png"),
+            save_path=plot_path("state_trajectory_by_input.png"),
+            condensed=cv,
         )
         plot_state_trajectory(
             hidden_states,
-            color_by_chars=targets,
+            color_by_chars=targets if cv is None else cv.next_chars,
             chars=model["chars"],
             title=f"Hidden state trajectory over {len(text)} chars (colored by TARGET / next char)",
-            save_path=os.path.join(out_dir, "state_trajectory_by_target.png"),
+            save_path=plot_path("state_trajectory_by_target.png"),
+            condensed=cv,
         )
 
     correct = np.sum(np.argmax(output_probs, axis=1) ==

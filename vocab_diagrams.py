@@ -358,6 +358,31 @@ def walk_dfa_prefix(dfa: DFA, prefix: str) -> int | None:
     return state
 
 
+def dfa_state_for_prefix(
+    prefix: str,
+    automaton: MinimizedVocabAutomaton,
+    *,
+    spaced: bool = False,
+) -> int:
+    """Minimized DFA state after reading `prefix` (start state on space when spaced)."""
+    if spaced and prefix == " ":
+        return automaton.dfa.start
+    state = walk_dfa_prefix(automaton.dfa, prefix)
+    return automaton.dfa.start if state is None else state
+
+
+def trie_prefix_display_order(words: list[str]) -> list[str]:
+    """Trie prefixes in BFS order (root empty prefix omitted)."""
+    root = build_trie(words)
+    states, _ = trie_states(root)
+    id_to_prefix = trie_prefixes(root)
+    return [
+        id_to_prefix[id(node)]
+        for node in states
+        if id_to_prefix[id(node)]
+    ]
+
+
 def dfa_state_at_position(
     text: str,
     index: int,
