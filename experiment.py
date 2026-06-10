@@ -110,6 +110,10 @@ def plots_dir(name: str) -> Path:
     return experiment_dir(name) / "plots"
 
 
+def learning_dynamics_dir(name: str) -> Path:
+    return experiment_dir(name) / "learning_dynamics"
+
+
 def plot_path(name: str, plot_name: str) -> Path:
     """e.g. plot_path('shared_letters', 'learning_curve.png')"""
     return plots_dir(name) / plot_name

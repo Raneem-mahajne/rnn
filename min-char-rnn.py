@@ -448,11 +448,53 @@ metric_word_error_frac = []
 
 weight_snap_iters: list[int] = []
 weight_snap_outgoing: list[np.ndarray] = []
+weight_snap_bias_hidden: list[np.ndarray] = []
+weight_snap_bias_output: list[np.ndarray] = []
 weight_snap_violation_frac: list[float] = []
 WEIGHT_SNAP_EVERY = 100
+WEIGHT_SNAP_ULTRA_UNTIL = 300
+WEIGHT_SNAP_DENSE_EVERY = 3
+WEIGHT_SNAP_DENSE_UNTIL = 1_200
 METRIC_ROLLOUT_LEN = 3_000
 METRIC_NUM_ROLLOUTS = 5
 METRIC_RNG_BASE = 42
+
+
+def _should_record_weight_snapshot(iteration: int) -> bool:
+    if iteration % WEIGHT_SNAP_EVERY == 0:
+        return True
+    if iteration <= WEIGHT_SNAP_ULTRA_UNTIL:
+        return True
+    return (
+        iteration <= WEIGHT_SNAP_DENSE_UNTIL
+        and iteration % WEIGHT_SNAP_DENSE_EVERY == 0
+    )
+
+
+def _append_weight_snapshot(iteration: int) -> None:
+    weight_snap_iters.append(iteration)
+    weight_snap_outgoing.append(
+        flatten_weight_snapshot(
+            weights_input_to_hidden,
+            weights_hidden_to_hidden,
+            weights_hidden_to_output,
+        )
+    )
+    weight_snap_bias_hidden.append(np.copy(bias_hidden))
+    weight_snap_bias_output.append(np.copy(bias_output))
+    if dale_law:
+        weight_snap_violation_frac.append(
+            dale_violation_fraction(
+                weights_input_to_hidden,
+                weights_hidden_to_hidden,
+                weights_hidden_to_output,
+                dale_sign,
+            )
+        )
+    else:
+        weight_snap_violation_frac.append(0.0)
+
+
 # Ignore early rollouts before real learning (checkpoint only on 0% invalid-word rate).
 MIN_CHECKPOINT_ITER = 8_000
 
@@ -496,6 +538,9 @@ demo_rng_seed = 0
 demo_seed_char = " " if (" " in char_to_index) else text[0]
 
 while iteration < max_iterations:
+  if iteration == 0:
+    _append_weight_snapshot(0)
+
   # Step the data pointer through the corpus in chunks of `sequence_length`.
   # If we run off the end (or we're on iteration 0), reset the hidden state and wrap to the start.
   if data_pointer + sequence_length + 1 >= len(text) or iteration == 0:
@@ -544,27 +589,6 @@ while iteration < max_iterations:
             )
             break
 
-    if iteration % WEIGHT_SNAP_EVERY == 0:
-      weight_snap_iters.append(iteration)
-      weight_snap_outgoing.append(
-          flatten_weight_snapshot(
-              weights_input_to_hidden,
-              weights_hidden_to_hidden,
-              weights_hidden_to_output,
-          )
-      )
-      if dale_law:
-        weight_snap_violation_frac.append(
-            dale_violation_fraction(
-                weights_input_to_hidden,
-                weights_hidden_to_hidden,
-                weights_hidden_to_output,
-                dale_sign,
-            )
-        )
-      else:
-        weight_snap_violation_frac.append(0.0)
-
     if iteration == 0:
       sample_before_text = rollout_text[:DEMO_SNIPPET_LEN]
       demo_rng_seed = METRIC_RNG_BASE
@@ -612,7 +636,9 @@ while iteration < max_iterations:
   adagrad_step(bias_output, grad_bias_output, mem_bias_output, effective_lr)
 
   data_pointer += sequence_length
-  iteration    += 1
+  iteration += 1
+  if iteration > 0 and _should_record_weight_snapshot(iteration):
+    _append_weight_snapshot(iteration)
 
 # Final sample after training finishes, plus the last smoothed loss.
 sampled_indices = sample(previous_hidden_state, char_to_index[text[0]], 50)
@@ -682,6 +708,8 @@ np.savez(
     best_metric_word_error_frac=np.array(best_word_err, dtype=np.float64),
     weight_snap_iterations=np.array(weight_snap_iters, dtype=np.int32),
     weight_snap_outgoing=np.array(weight_snap_outgoing, dtype=np.float64),
+    weight_snap_bias_hidden=np.array(weight_snap_bias_hidden, dtype=np.float64),
+    weight_snap_bias_output=np.array(weight_snap_bias_output, dtype=np.float64),
     weight_snap_violation_frac=np.array(weight_snap_violation_frac, dtype=np.float64),
     vocab_words=np.array(sorted(vocab_words)),
     sample_before=np.array(sample_before_text if sample_before_text is not None else ""),

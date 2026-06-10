@@ -55,6 +55,9 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
   13) weight_dynamics_over_training.png
        Eight E/I-block heatmaps of W_xh and W_hh weights over training snapshots.
 
+  14) learning_dynamics/hidden_state_pca.mp4 (or .gif)
+       Hidden states on a fixed final-model PCA basis across weight snapshots.
+
 Usage:
     python visualize.py --exp ten_word_overlap_s
     python visualize.py --exp ten_word_overlap --length 100
@@ -80,6 +83,7 @@ from experiment import (
     ensure_experiment_dirs,
     experiment_uses_word_space,
     input_path,
+    learning_dynamics_dir,
     model_path,
     plots_dir,
 )
@@ -160,6 +164,10 @@ def load_model(path: str = "model.npz"):
         model["weight_snap_iterations"] = data["weight_snap_iterations"]
         model["weight_snap_outgoing"] = data["weight_snap_outgoing"]
         model["weight_snap_violation_frac"] = data["weight_snap_violation_frac"]
+    if "weight_snap_bias_hidden" in data.files:
+        model["weight_snap_bias_hidden"] = data["weight_snap_bias_hidden"]
+    if "weight_snap_bias_output" in data.files:
+        model["weight_snap_bias_output"] = data["weight_snap_bias_output"]
     if "metric_word_error_frac" in data.files:
         model["metric_word_error_frac"] = data["metric_word_error_frac"]
     return model
@@ -1147,6 +1155,361 @@ def pca_2d(points):
 def reconstruct_from_pca(coords, mean, components):
     """Approximate hidden states from PC1/PC2 (other PCs set to zero)."""
     return mean + coords @ components
+
+
+def project_to_fixed_pca(hidden_states, mean, components):
+    """Project hidden states into a pre-fit PCA basis."""
+    return (hidden_states - mean) @ components.T
+
+
+def model_at_weight_snapshot(model: dict, snap_idx: int) -> dict:
+    """Reconstruct model weights (and biases when saved) at a training snapshot."""
+    from rnn_dyn import unpack_weight_snapshot
+
+    hidden_size = int(model["hidden_size"])
+    vocab_size = int(model["vocab_size"])
+    vec = np.asarray(model["weight_snap_outgoing"][snap_idx], dtype=float)
+    W_in, W_hh, W_ho = unpack_weight_snapshot(vec, hidden_size, vocab_size)
+    snap_model = dict(model)
+    snap_model["weights_input_to_hidden"] = W_in
+    snap_model["weights_hidden_to_hidden"] = W_hh
+    snap_model["weights_hidden_to_output"] = W_ho
+    if "weight_snap_bias_hidden" in model:
+        snap_model["bias_hidden"] = np.asarray(
+            model["weight_snap_bias_hidden"][snap_idx],
+        ).reshape(-1, 1)
+    if "weight_snap_bias_output" in model:
+        snap_model["bias_output"] = np.asarray(
+            model["weight_snap_bias_output"][snap_idx],
+        ).reshape(-1, 1)
+    return snap_model
+
+
+def _encode_frame_sequence(frame_paths: list[str], out_path: str, *, fps: int) -> str:
+    """Encode PNG frames to mp4 (ffmpeg) or gif (Pillow). Returns path written."""
+    import shutil
+    import subprocess
+
+    if not frame_paths:
+        raise ValueError("no frames to encode")
+
+    mp4_path = out_path if out_path.endswith(".mp4") else f"{out_path}.mp4"
+    if shutil.which("ffmpeg"):
+        frame_dir = os.path.dirname(frame_paths[0])
+        pattern = os.path.join(frame_dir, "frame_%04d.png")
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", pattern,
+                "-pix_fmt", "yuv420p",
+                mp4_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return mp4_path
+
+    try:
+        import imageio.v3 as iio
+
+        frames = [iio.imread(fp) for fp in frame_paths]
+        iio.imwrite(mp4_path, frames, fps=fps, codec="libx264")
+        return mp4_path
+    except Exception:
+        pass
+
+    from PIL import Image
+
+    gif_path = out_path.replace(".mp4", ".gif")
+    images = [Image.open(fp) for fp in frame_paths]
+    duration_ms = max(int(1000 / fps), 1)
+    images[0].save(
+        gif_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    for im in images:
+        im.close()
+    return gif_path
+
+
+def _snapshot_mean_displacements(projected_frames: list[np.ndarray]) -> np.ndarray:
+    """Per-snapshot step size (index 0 is 0)."""
+    projs = [np.asarray(p, dtype=float) for p in projected_frames]
+    disps = np.zeros(len(projs), dtype=float)
+    for t in range(1, len(projs)):
+        step = projs[t] - projs[t - 1]
+        disps[t] = float(np.linalg.norm(step, axis=-1).mean())
+    return disps
+
+
+def _displacement_weights_at_iters(
+    model: dict,
+    iters: np.ndarray,
+    projected_frames: list[np.ndarray],
+    *,
+    error_weight: float = 0.35,
+) -> np.ndarray:
+    """Per-step weights for resampling: PCA displacement + optional word-error drop."""
+    disps = _snapshot_mean_displacements(projected_frames)
+    weights = disps.copy()
+    if error_weight <= 0:
+        return weights
+
+    metric_iters = np.asarray(model.get("metric_iterations", []), dtype=float)
+    metric_err = np.asarray(model.get("metric_word_error_frac", []), dtype=float)
+    if len(metric_iters) < 2:
+        return weights
+
+    err_on_snaps = np.interp(iters.astype(float), metric_iters, metric_err)
+    err_drop = np.zeros(len(iters), dtype=float)
+    err_drop[1:] = np.maximum(0.0, err_on_snaps[:-1] - err_on_snaps[1:])
+    err_scale = float(np.max(disps[1:])) if np.any(disps[1:] > 0) else 1.0
+    err_max = float(np.max(err_drop[1:])) if np.any(err_drop[1:] > 0) else 0.0
+    if err_max > 0:
+        weights[1:] += error_weight * err_scale * (err_drop[1:] / err_max)
+    return weights
+
+
+def resample_frames_by_displacement(
+    model: dict,
+    iters: np.ndarray,
+    projected_frames: list[np.ndarray],
+    n_video_frames: int,
+    *,
+    error_weight: float = 0.35,
+) -> list[tuple[int, float, np.ndarray]]:
+    """Sample video frames uniformly in cumulative displacement (linearly interpolated)."""
+    iters_f = np.asarray(iters, dtype=float)
+    projs = [np.asarray(p, dtype=float) for p in projected_frames]
+    if len(projs) < 2 or n_video_frames < 2:
+        n = min(len(projs), max(n_video_frames, 1))
+        return [
+            (int(iters[i]), 100.0 * i / max(n - 1, 1), projs[i]) for i in range(n)
+        ]
+
+    weights = _displacement_weights_at_iters(
+        model, iters, projected_frames, error_weight=error_weight,
+    )
+    cum = np.cumsum(weights)
+    total = float(cum[-1])
+    if total <= 0:
+        return [
+            (int(iters_f[i]), 100.0 * i / max(len(projs) - 1, 1), projs[i])
+            for i in range(len(projs))
+        ]
+
+    out: list[tuple[int, float, np.ndarray]] = []
+    for k in range(n_video_frames):
+        target = (k / (n_video_frames - 1)) * total
+        idx = int(np.searchsorted(cum, target, side="right")) - 1
+        idx = min(max(idx, 0), len(projs) - 2)
+        seg_lo, seg_hi = float(cum[idx]), float(cum[idx + 1])
+        alpha = (target - seg_lo) / (seg_hi - seg_lo) if seg_hi > seg_lo else 0.0
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        proj = (1.0 - alpha) * projs[idx] + alpha * projs[idx + 1]
+        iter_num = int(round((1.0 - alpha) * iters_f[idx] + alpha * iters_f[idx + 1]))
+        geom_pct = 100.0 * target / total
+        out.append((iter_num, geom_pct, proj))
+    return out
+
+
+def geometry_learning_end_iteration(
+    iters: np.ndarray,
+    projected_frames: list[np.ndarray],
+    *,
+    cumulative_fraction: float = 0.90,
+    tail_iters: int = 30,
+) -> int:
+    """Last training iter to show once PCA geometry has moved most of its distance."""
+    if len(projected_frames) < 2:
+        return int(iters[-1])
+
+    disps: list[float] = []
+    for t in range(1, len(projected_frames)):
+        step = np.asarray(projected_frames[t]) - np.asarray(projected_frames[t - 1])
+        disps.append(float(np.linalg.norm(step, axis=-1).mean()))
+
+    cum = np.cumsum(disps)
+    total = float(cum[-1])
+    if total <= 0:
+        return int(iters[-1])
+
+    idx = int(np.searchsorted(cum, cumulative_fraction * total))
+    idx = min(idx + 1, len(iters) - 1)
+    return int(iters[idx]) + int(tail_iters)
+
+
+def learning_plateau_iteration(
+    model: dict,
+    *,
+    fraction_remaining: float = 0.05,
+    min_iter: int = 100,
+) -> int:
+    """First iteration where smoothed loss is within `fraction_remaining` of its total drop."""
+    iters = np.asarray(model.get("loss_iterations", []), dtype=int)
+    smooth = np.asarray(model.get("loss_smooth", []), dtype=float)
+    if len(iters) < 2:
+        return int(iters[-1]) if len(iters) else 0
+
+    tail = smooth[-max(100, len(smooth) // 20):]
+    finite_tail = tail[np.isfinite(tail)]
+    final_loss = float(np.median(finite_tail)) if finite_tail.size else float(smooth[-1])
+    initial_loss = float(smooth[0])
+    drop = initial_loss - final_loss
+    if drop <= 0:
+        return int(iters[-1])
+
+    threshold = final_loss + fraction_remaining * drop
+    for it, loss in zip(iters, smooth):
+        if int(it) < min_iter:
+            continue
+        if np.isfinite(loss) and loss <= threshold:
+            return int(it)
+    return int(iters[-1])
+
+
+def write_hidden_state_pca_learning_video(
+    model: dict,
+    text: str,
+    save_path: str,
+    *,
+    spaced: bool = False,
+    automaton: MinimizedVocabAutomaton | None = None,
+    fps: int = 4,
+    video_frames: int | None = None,
+    frame_subsample: int = 1,
+    dpi: int = 100,
+    max_iter: int | None = None,
+    annot_style: str = "leaders",
+    error_weight: float = 0.35,
+) -> None:
+    """Animate hidden states in the final-model PCA basis over the learning phase."""
+    if "weight_snap_outgoing" not in model:
+        print(f"skip {save_path}: re-run min-char-rnn.py to record weight snapshots")
+        return
+
+    snaps = np.asarray(model["weight_snap_outgoing"], dtype=float)
+    iters = np.asarray(model["weight_snap_iterations"], dtype=int)
+    if snaps.ndim != 2 or snaps.shape[0] < 2:
+        print(f"skip {save_path}: insufficient weight snapshot history")
+        return
+
+    from rnn_dyn import snapshot_vector_layout
+
+    hidden_size = int(model["hidden_size"])
+    vocab_size = int(model["vocab_size"])
+    if snapshot_vector_layout(hidden_size, vocab_size, snaps.shape[1]) != "full":
+        print(
+            f"skip {save_path}: re-run training for full snapshots "
+            "(need W_xh + W_hh in weight_snap_outgoing)",
+        )
+        return
+
+    if automaton is None:
+        print(f"skip {save_path}: vocabulary automaton required for DFA coloring")
+        return
+
+    final_hidden, _ = forward_pass(model, text)
+    _, mean, components, evr = fit_pca_2d_with_evr(final_hidden)
+    pc1 = 100.0 * float(evr[0]) if len(evr) > 0 else 0.0
+    pc2 = 100.0 * float(evr[1]) if len(evr) > 1 else 0.0
+
+    state_ids = _dfa_state_ids_at_timesteps(text, automaton, spaced=spaced)
+    state_colors = _state_id_colors(state_ids)
+
+    scan_cap = min(int(iters[-1]), 600)
+    scan_idx = np.where(iters <= scan_cap)[0]
+    projected_scan: list[np.ndarray] = []
+    for snap_i in scan_idx:
+        snap_model = model_at_weight_snapshot(model, int(snap_i))
+        hidden_states, _ = forward_pass(snap_model, text)
+        projected_scan.append(project_to_fixed_pca(hidden_states, mean, components))
+
+    loss_plateau = learning_plateau_iteration(model)
+    if max_iter is None:
+        max_iter = geometry_learning_end_iteration(
+            iters[scan_idx], projected_scan,
+        )
+    max_iter = min(int(max_iter), int(iters[-1]))
+
+    in_range = iters <= max_iter
+    frame_idx = np.where(in_range)[0]
+    frame_idx = frame_idx[:: max(int(frame_subsample), 1)]
+    if frame_idx.size < 2:
+        print(f"skip {save_path}: no snapshots in learning window (max_iter={max_iter})")
+        return
+
+    scan_lookup = {int(i): j for j, i in enumerate(scan_idx)}
+    projected_frames: list[np.ndarray] = []
+    for snap_i in frame_idx:
+        j = scan_lookup.get(int(snap_i))
+        if j is not None:
+            projected_frames.append(projected_scan[j])
+        else:
+            snap_model = model_at_weight_snapshot(model, int(snap_i))
+            hidden_states, _ = forward_pass(snap_model, text)
+            projected_frames.append(project_to_fixed_pca(hidden_states, mean, components))
+
+    snap_iters = iters[frame_idx]
+    n_out = int(video_frames) if video_frames is not None else fps * 72
+    n_out = max(n_out, 2)
+    timeline = resample_frames_by_displacement(
+        model, snap_iters, projected_frames, n_out, error_weight=error_weight,
+    )
+    print(
+        f"learning video: snapshots 0-{max_iter} -> {len(timeline)} frames "
+        f"(displacement-paced, geometry end ~{max_iter}, loss plateau ~{loss_plateau})",
+    )
+
+    xlim, ylim = _square_data_limits(
+        *[p for _, _, p in timeline], padding_frac=0.38,
+    )
+
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    import tempfile
+
+    frame_paths: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="rnn_pca_frames_") as tmp:
+        for frame_no, (iter_num, geom_pct, projected) in enumerate(timeline):
+            fig, ax = plt.subplots(figsize=(12.8, 12.8), constrained_layout=True)
+            add_dfa_state_annotations(
+                ax,
+                text,
+                projected,
+                automaton,
+                spaced=spaced,
+                state_colors=state_colors,
+                annot_style=annot_style,
+                point_size=70,
+                label_fontsize=11,
+                leader_linewidth=1.6,
+            )
+            ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+            ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel(f"PC1 ({pc1:.1f}%)")
+            ax.set_ylabel(f"PC2 ({pc2:.1f}%)")
+            ctx = prefix_axis_label(spaced=spaced, text=text)
+            ax.set_title(
+                f"Hidden states in fixed final-model PCA · {ctx}\n"
+                f"geometry {geom_pct:.0f}% · training iter {int(iter_num)}",
+            )
+            ax.grid(True, linestyle=":", alpha=0.35)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            fp = os.path.join(tmp, f"frame_{frame_no:04d}.png")
+            fig.savefig(fp, dpi=dpi, bbox_inches="tight")
+            plt.close(fig)
+            frame_paths.append(fp)
+
+        written = _encode_frame_sequence(frame_paths, save_path, fps=fps)
+    print(f"wrote {written}")
 
 
 def argmax_next_char(model, hidden_states):
@@ -3641,6 +4004,17 @@ def main() -> None:
         trie_path, dfa_path = write_vocabulary_diagrams(words, Path(out_dir))
         print(f"wrote {trie_path}")
         print(f"wrote {dfa_path}")
+
+    if args.exp and automaton is not None and not args.condensed:
+        dyn_dir = learning_dynamics_dir(args.exp)
+        dyn_dir.mkdir(parents=True, exist_ok=True)
+        write_hidden_state_pca_learning_video(
+            model,
+            text,
+            save_path=str(dyn_dir / "hidden_state_pca.mp4"),
+            spaced=spaced,
+            automaton=automaton,
+        )
 
 
 if __name__ == "__main__":
